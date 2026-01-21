@@ -76,6 +76,12 @@ fn parseInternal(
             return ParseError.Help;
         }
 
+        // End of options marker
+        if (std.mem.eql(u8, arg, "--")) {
+            if (i + 1 < args.len and first_pos == args.len) first_pos = i + 1;
+            break;
+        }
+
         // Long option: --name or --name=value
         if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
             const rest = arg[2..];
@@ -731,4 +737,19 @@ test "trailing options after positionals" {
     try std.testing.expect(opts.count);
     try std.testing.expectEqual(@as(usize, 4), rest.len);
     try std.testing.expectEqualStrings("path1", rest[0]);
+}
+
+test "double dash stops option parsing" {
+    const Opts = struct {
+        verbose: bool = false,
+        pub const meta = .{ .verbose = .{ .short = 'v' } };
+    };
+
+    var opts = Opts{};
+    const rest = try parse(Opts, &opts, &.{ "-v", "--", "-not-an-option", "file" });
+
+    try std.testing.expect(opts.verbose);
+    try std.testing.expectEqual(@as(usize, 2), rest.len);
+    try std.testing.expectEqualStrings("-not-an-option", rest[0]);
+    try std.testing.expectEqualStrings("file", rest[1]);
 }
