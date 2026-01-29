@@ -44,6 +44,7 @@ pub fn main() !void {
 - **Inline values** - `-p8080` and `--port=8080`
 - **Negation with `--no-*`** - `--no-verbose` sets bool to false, `--no-config` sets optional to null
 - **Value-optional flags** - `--compress` alone vs `--compress=gzip` via `flag_value`
+- **Custom parsers** - `parse` in meta for octal, special formats, validation
 - **Repeatable options** - `Multi(T, capacity)` for `-x foo -x bar`
 - **Subcommands** - `parseMerged` for git-style CLIs
 - **Type support** - strings, integers, bools, enums, optionals
@@ -158,6 +159,32 @@ const Opts = struct {
 // --compress       → .on (flag_value)
 // --compress=gzip  → .gzip (parsed)
 // --no-compress    → .off (no_value)
+```
+
+## Custom parsers
+
+For special formats like octal, use `parse` in meta. The function can return `T`, `?T`, or `!T`:
+
+```zig
+const Opts = struct {
+    chmod: ?u16 = 0o755,
+
+    pub const meta = .{
+        .chmod = .{
+            .parse = struct {
+                fn p(val: []const u8) ?u16 {
+                    return std.fmt.parseInt(u16, val, 8) catch null;
+                }
+            }.p,
+            .help = "File mode in octal",
+        },
+    };
+};
+
+// --chmod 644    → 0o644
+// --chmod 755    → 0o755
+// --chmod 899    → error (invalid octal)
+// --no-chmod     → null
 ```
 
 ## Subcommands

@@ -330,6 +330,22 @@ fn setValue(
         return ParseError.MissingValue;
     }
 
+    // Check for custom parse function in meta
+    if (has_meta and @hasField(@TypeOf(T.meta), field.name)) {
+        const field_meta = @field(T.meta, field.name);
+        if (@hasField(@TypeOf(field_meta), "parse")) {
+            const result = field_meta.parse(value.?);
+            if (@typeInfo(@TypeOf(result)) == .error_union) {
+                @field(opts, field.name) = result catch return ParseError.InvalidValue;
+            } else if (@typeInfo(@TypeOf(result)) == .optional) {
+                @field(opts, field.name) = result orelse return ParseError.InvalidValue;
+            } else {
+                @field(opts, field.name) = result;
+            }
+            return;
+        }
+    }
+
     // Repeatable options: append when the field is a list-like type.
     if (listElemType(F)) |Elem| {
         const parsed = try parseScalar(Elem, value.?);
@@ -971,4 +987,94 @@ test "flag_value followed by other flags" {
         const result = parse(Opts, &opts, &.{"--level"});
         try std.testing.expectError(ParseError.MissingValue, result);
     }
+}
+
+test "custom parse function" {
+    const Opts = struct {
+        chmod: ?u16 = 0o755,
+
+        pub const meta = .{
+            .chmod = .{
+                .parse = struct {
+                    fn p(val: []const u8) ?u16 {
+                        return std.fmt.parseInt(u16, val, 8) catch null;
+                    }
+                }.p,
+                .help = "File mode in octal",
+            },
+        };
+    };
+
+    // Valid octal
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{ "--chmod", "644" });
+        try std.testing.expectEqual(@as(?u16, 0o644), opts.chmod);
+    }
+
+    // Another valid octal
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{ "--chmod", "755" });
+        try std.testing.expectEqual(@as(?u16, 0o755), opts.chmod);
+    }
+
+    // Invalid octal (has 8 and 9)
+    {
+        var opts = Opts{};
+        const result = parse(Opts, &opts, &.{ "--chmod", "899" });
+        try std.testing.expectError(ParseError.InvalidValue, result);
+    }
+}
+
+test "custom parse function returning error union" {
+    const Opts = struct {
+        port: u16 = 8080,
+
+        pub const meta = .{
+            .port = .{
+                .parse = struct {
+                    fn p(val: []const u8) error{InvalidPort}!u16 {
+                        const n = std.fmt.parseInt(u16, val, 10) catch return error.InvalidPort;
+                        if (n < 1024) return error.InvalidPort; // reject privileged ports
+                        return n;
+                    }
+                }.p,
+            },
+        };
+    };
+
+    // Valid port
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{ "--port", "3000" });
+        try std.testing.expectEqual(@as(u16, 3000), opts.port);
+    }
+
+    // Invalid (privileged port)
+    {
+        var opts = Opts{};
+        const result = parse(Opts, &opts, &.{ "--port", "80" });
+        try std.testing.expectError(ParseError.InvalidValue, result);
+    }
+}
+
+test "custom parse with --no-* still works" {
+    const Opts = struct {
+        chmod: ?u16 = 0o755,
+
+        pub const meta = .{
+            .chmod = .{
+                .parse = struct {
+                    fn p(val: []const u8) ?u16 {
+                        return std.fmt.parseInt(u16, val, 8) catch null;
+                    }
+                }.p,
+            },
+        };
+    };
+
+    var opts = Opts{};
+    _ = try parse(Opts, &opts, &.{"--no-chmod"});
+    try std.testing.expectEqual(@as(?u16, null), opts.chmod);
 }
