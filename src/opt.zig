@@ -64,15 +64,20 @@ fn parseInternal(
 
     var i: usize = 0;
     var found_subcmd = false;
-    var first_pos: usize = args.len;
+    var positional_count: usize = 0;
+    var stop_parsing_options = false;
 
+    // First pass: count positionals and parse options
     while (i < args.len) : (i += 1) {
         const arg = args[i];
 
         if (arg.len == 0) continue;
 
-        // Once we hit first positional, everything after is positional
-        if (first_pos != args.len) continue;
+        // After --, everything is positional
+        if (stop_parsing_options) {
+            positional_count += 1;
+            continue;
+        }
 
         // Help flag
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -81,8 +86,8 @@ fn parseInternal(
 
         // End of options marker - everything after is positional
         if (std.mem.eql(u8, arg, "--")) {
-            if (i + 1 < args.len) first_pos = i + 1;
-            break;
+            stop_parsing_options = true;
+            continue;
         }
 
         // Long option: --name or --name=value or --no-name
@@ -176,10 +181,93 @@ fn parseInternal(
             found_subcmd = true;
             continue;
         }
-        if (first_pos == args.len) first_pos = i;
+        positional_count += 1;
     }
 
-    return args[first_pos..];
+    // Second pass: collect positionals into buffer using thread-local storage
+    const S2 = struct {
+        threadlocal var positional_buf: [256][]const u8 = undefined;
+    };
+
+    var pos_idx: usize = 0;
+    i = 0;
+    found_subcmd = false;
+    stop_parsing_options = false;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        if (arg.len == 0) continue;
+
+        // After --, everything is positional
+        if (stop_parsing_options) {
+            if (pos_idx < 256) {
+                S2.positional_buf[pos_idx] = arg;
+                pos_idx += 1;
+            }
+            continue;
+        }
+
+        // End of options marker
+        if (std.mem.eql(u8, arg, "--")) {
+            stop_parsing_options = true;
+            continue;
+        }
+
+        // Long option - skip it and its value
+        if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
+            const rest = arg[2..];
+            var name: []const u8 = rest;
+            var has_inline_value = false;
+
+            if (rest.len > 3 and std.mem.startsWith(u8, rest, "no-")) {
+                name = rest[3..];
+            }
+
+            if (std.mem.indexOf(u8, name, "=")) |_| {
+                has_inline_value = true;
+            }
+
+            // Skip next arg if it's the value (non-bool option without inline value)
+            if (!has_inline_value) {
+                var name_buf: [64]u8 = undefined;
+                const norm_name = normalizeName(name, &name_buf);
+                if (needsValue(G, g_fields, g_has_meta, norm_name) or
+                    (merged and S != void and needsValue(S, s_fields, s_has_meta, norm_name)))
+                {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Short option - skip it and its value
+        if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+            const short = arg[1];
+            const has_inline_value = arg.len > 2;
+
+            // Skip next arg if it's the value
+            if (!has_inline_value) {
+                if (needsValueShort(G, g_fields, g_has_meta, short) or
+                    (merged and S != void and needsValueShort(S, s_fields, s_has_meta, short)))
+                {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Positional
+        if (merged and !found_subcmd) {
+            found_subcmd = true;
+            continue;
+        }
+        if (pos_idx < 256) {
+            S2.positional_buf[pos_idx] = arg;
+            pos_idx += 1;
+        }
+    }
+
+    return S2.positional_buf[0..pos_idx];
 }
 
 fn normalizeName(name: []const u8, buf: []u8) []const u8 {
@@ -190,6 +278,51 @@ fn normalizeName(name: []const u8, buf: []u8) []const u8 {
         j += 1;
     }
     return buf[0..j];
+}
+
+fn needsValue(
+    comptime T: type,
+    comptime fields: []const std.builtin.Type.StructField,
+    comptime has_meta: bool,
+    name: []const u8,
+) bool {
+    _ = T;
+    _ = has_meta;
+    inline for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) {
+            // Bool fields don't need a value
+            if (field.type == bool) return false;
+            // Optional bool fields don't need a value
+            if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return false;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn needsValueShort(
+    comptime T: type,
+    comptime fields: []const std.builtin.Type.StructField,
+    comptime has_meta: bool,
+    short: u8,
+) bool {
+    if (!has_meta) return false;
+
+    inline for (fields) |field| {
+        if (@hasField(@TypeOf(T.meta), field.name)) {
+            const field_meta = @field(T.meta, field.name);
+            if (@hasField(@TypeOf(field_meta), "short")) {
+                if (field_meta.short == short) {
+                    // Bool fields don't need a value
+                    if (field.type == bool) return false;
+                    // Optional bool fields don't need a value
+                    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return false;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 const FieldResult = enum { not_found, ok, missing_value, invalid_value };
@@ -814,7 +947,7 @@ test "repeatable option appends" {
     try std.testing.expectEqualStrings("pyc", got[1]);
 }
 
-test "options stop at first positional" {
+test "trailing options after positionals" {
     const Opts = struct {
         sudo: bool = false,
         restart: []const u8 = "",
@@ -825,12 +958,10 @@ test "options stop at first positional" {
     const rest = try parse(Opts, &opts, &.{ "--sudo", "src:dst", "ygs", "--restart", "cmd" });
 
     try std.testing.expect(opts.sudo);
-    try std.testing.expectEqualStrings("", opts.restart); // not parsed, comes after positional
-    try std.testing.expectEqual(@as(usize, 4), rest.len);
+    try std.testing.expectEqualStrings("cmd", opts.restart); // parsed even after positional
+    try std.testing.expectEqual(@as(usize, 2), rest.len);
     try std.testing.expectEqualStrings("src:dst", rest[0]);
     try std.testing.expectEqualStrings("ygs", rest[1]);
-    try std.testing.expectEqualStrings("--restart", rest[2]);
-    try std.testing.expectEqualStrings("cmd", rest[3]);
 }
 
 test "double dash stops option parsing" {
