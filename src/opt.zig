@@ -71,14 +71,17 @@ fn parseInternal(
 
         if (arg.len == 0) continue;
 
+        // Once we hit first positional, everything after is positional
+        if (first_pos != args.len) continue;
+
         // Help flag
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return ParseError.Help;
         }
 
-        // End of options marker
+        // End of options marker - everything after is positional
         if (std.mem.eql(u8, arg, "--")) {
-            if (i + 1 < args.len and first_pos == args.len) first_pos = i + 1;
+            if (i + 1 < args.len) first_pos = i + 1;
             break;
         }
 
@@ -811,24 +814,23 @@ test "repeatable option appends" {
     try std.testing.expectEqualStrings("pyc", got[1]);
 }
 
-test "trailing options after positionals" {
+test "options stop at first positional" {
     const Opts = struct {
-        verbose: bool = false,
-        count: bool = false,
-
-        pub const meta = .{
-            .verbose = .{ .short = 'v' },
-            .count = .{},
-        };
+        sudo: bool = false,
+        restart: []const u8 = "",
     };
 
     var opts = Opts{};
-    const rest = try parse(Opts, &opts, &.{ "path1", "--count", "path2", "-v" });
+    // ship --sudo zig-out/bin/wizig:/usr/bin/wizig ygs --restart 'sudo systemctl restart wizig'
+    const rest = try parse(Opts, &opts, &.{ "--sudo", "src:dst", "ygs", "--restart", "cmd" });
 
-    try std.testing.expect(opts.verbose);
-    try std.testing.expect(opts.count);
+    try std.testing.expect(opts.sudo);
+    try std.testing.expectEqualStrings("", opts.restart); // not parsed, comes after positional
     try std.testing.expectEqual(@as(usize, 4), rest.len);
-    try std.testing.expectEqualStrings("path1", rest[0]);
+    try std.testing.expectEqualStrings("src:dst", rest[0]);
+    try std.testing.expectEqualStrings("ygs", rest[1]);
+    try std.testing.expectEqualStrings("--restart", rest[2]);
+    try std.testing.expectEqualStrings("cmd", rest[3]);
 }
 
 test "double dash stops option parsing" {

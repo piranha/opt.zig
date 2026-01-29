@@ -117,6 +117,22 @@ pub const about = .{
 };
 ```
 
+## Positional arguments
+
+Options are parsed until the first positional argument. After that, everything is positional:
+
+```zig
+// myapp --verbose file1 --unknown file2
+// Result: verbose=true, positionals=["file1", "--unknown", "file2"]
+```
+
+Use `--` to explicitly end options when you have no positionals before:
+
+```zig
+// myapp -v -- --not-an-option
+// Result: verbose=true, positionals=["--not-an-option"]
+```
+
 ## Negation with `--no-*`
 
 The `--no-*` prefix negates options:
