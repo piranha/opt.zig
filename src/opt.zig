@@ -82,22 +82,32 @@ fn parseInternal(
             break;
         }
 
-        // Long option: --name or --name=value
+        // Long option: --name or --name=value or --no-name
         if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
             const rest = arg[2..];
             var name: []const u8 = rest;
             var inline_value: ?[]const u8 = null;
+            var is_negated = false;
 
-            if (std.mem.indexOf(u8, rest, "=")) |eq| {
-                name = rest[0..eq];
-                inline_value = rest[eq + 1 ..];
+            // Check for --no-* prefix
+            if (rest.len > 3 and std.mem.startsWith(u8, rest, "no-")) {
+                is_negated = true;
+                name = rest[3..];
+            }
+
+            if (std.mem.indexOf(u8, name, "=")) |eq| {
+                inline_value = name[eq + 1 ..];
+                name = name[0..eq];
             }
 
             var name_buf: [64]u8 = undefined;
             const norm_name = normalizeName(name, &name_buf);
 
             // Try global first, then subcommand
-            const g_result = setField(G, g_fields, g_has_meta, global, norm_name, inline_value, args, &i);
+            const g_result = if (is_negated)
+                setFieldNegated(G, g_fields, g_has_meta, global, norm_name)
+            else
+                setField(G, g_fields, g_has_meta, global, norm_name, inline_value, args, &i);
             switch (g_result) {
                 .ok => continue,
                 .missing_value => return ParseError.MissingValue,
@@ -105,7 +115,10 @@ fn parseInternal(
                 .not_found => {},
             }
             if (merged and S != void) {
-                const s_result = setField(S, s_fields, s_has_meta, sub, norm_name, inline_value, args, &i);
+                const s_result = if (is_negated)
+                    setFieldNegated(S, s_fields, s_has_meta, sub, norm_name)
+                else
+                    setField(S, s_fields, s_has_meta, sub, norm_name, inline_value, args, &i);
                 switch (s_result) {
                     .ok => continue,
                     .missing_value => return ParseError.MissingValue,
@@ -200,6 +213,55 @@ fn setField(
     return .not_found;
 }
 
+fn setFieldNegated(
+    comptime T: type,
+    comptime fields: []const std.builtin.Type.StructField,
+    comptime has_meta: bool,
+    opts: *T,
+    name: []const u8,
+) FieldResult {
+    inline for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) {
+            setNegatedValue(T, opts, field, has_meta) catch return .invalid_value;
+            return .ok;
+        }
+    }
+    return .not_found;
+}
+
+fn setNegatedValue(
+    comptime T: type,
+    opts: *T,
+    comptime field: std.builtin.Type.StructField,
+    comptime has_meta: bool,
+) ParseError!void {
+    const F = field.type;
+
+    // Check for no_value in meta first
+    if (has_meta and @hasField(@TypeOf(T.meta), field.name)) {
+        const field_meta = @field(T.meta, field.name);
+        if (@hasField(@TypeOf(field_meta), "no_value")) {
+            @field(opts, field.name) = field_meta.no_value;
+            return;
+        }
+    }
+
+    // Bool fields: --no-foo sets to false
+    if (F == bool) {
+        @field(opts, field.name) = false;
+        return;
+    }
+
+    // Optional fields: --no-foo sets to null
+    if (@typeInfo(F) == .optional) {
+        @field(opts, field.name) = null;
+        return;
+    }
+
+    // No no_value in meta and not bool/optional - error
+    return ParseError.InvalidValue;
+}
+
 fn setFieldByShort(
     comptime T: type,
     comptime fields: []const std.builtin.Type.StructField,
@@ -246,16 +308,31 @@ fn setValue(
         return;
     }
 
-    // Get value from inline or next arg
-    const value = inline_value orelse blk: {
-        if (i.* + 1 >= args.len) return ParseError.MissingValue;
+    // Check if we have a value (inline or next arg that doesn't look like a flag)
+    const value: ?[]const u8 = inline_value orelse blk: {
+        if (i.* + 1 >= args.len) break :blk null;
+        const next = args[i.* + 1];
+        // Next arg looks like a flag, not a value
+        if (next.len > 0 and next[0] == '-') break :blk null;
         i.* += 1;
-        break :blk args[i.*];
+        break :blk next;
     };
+
+    // No value provided - check for flag_value in meta
+    if (value == null) {
+        if (has_meta and @hasField(@TypeOf(T.meta), field.name)) {
+            const field_meta = @field(T.meta, field.name);
+            if (@hasField(@TypeOf(field_meta), "flag_value")) {
+                @field(opts, field.name) = field_meta.flag_value;
+                return;
+            }
+        }
+        return ParseError.MissingValue;
+    }
 
     // Repeatable options: append when the field is a list-like type.
     if (listElemType(F)) |Elem| {
-        const parsed = try parseScalar(Elem, value);
+        const parsed = try parseScalar(Elem, value.?);
         var list_ptr = &@field(opts, field.name);
         list_ptr.append(parsed) catch |e| {
             const name = @errorName(e);
@@ -266,8 +343,7 @@ fn setValue(
         return;
     }
 
-    @field(opts, field.name) = try parseScalar(F, value);
-    _ = has_meta;
+    @field(opts, field.name) = try parseScalar(F, value.?);
 }
 
 fn parseScalar(comptime T: type, value: []const u8) ParseError!T {
@@ -752,4 +828,147 @@ test "double dash stops option parsing" {
     try std.testing.expectEqual(@as(usize, 2), rest.len);
     try std.testing.expectEqualStrings("-not-an-option", rest[0]);
     try std.testing.expectEqualStrings("file", rest[1]);
+}
+
+test "negated bool with --no-*" {
+    const Opts = struct {
+        verbose: bool = true,
+        debug: bool = false,
+    };
+
+    var opts = Opts{};
+    _ = try parse(Opts, &opts, &.{ "--no-verbose", "--debug" });
+
+    try std.testing.expect(!opts.verbose);
+    try std.testing.expect(opts.debug);
+}
+
+test "negated optional with --no-*" {
+    const Opts = struct {
+        config: ?[]const u8 = "default.conf",
+        limit: ?u32 = 100,
+    };
+
+    var opts = Opts{};
+    _ = try parse(Opts, &opts, &.{ "--no-config", "--no-limit" });
+
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.config);
+    try std.testing.expectEqual(@as(?u32, null), opts.limit);
+}
+
+test "negated with no_value in meta" {
+    const Compress = enum { off, on, auto };
+    const Opts = struct {
+        compress: Compress = .auto,
+
+        pub const meta = .{
+            .compress = .{ .no_value = .off },
+        };
+    };
+
+    var opts = Opts{};
+    _ = try parse(Opts, &opts, &.{"--no-compress"});
+
+    try std.testing.expectEqual(Compress.off, opts.compress);
+}
+
+test "flag_value for value-optional flags" {
+    const Compress = enum { off, on, auto };
+    const Opts = struct {
+        compress: Compress = .auto,
+
+        pub const meta = .{
+            .compress = .{ .flag_value = .on },
+        };
+    };
+
+    // --compress alone uses flag_value
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"--compress"});
+        try std.testing.expectEqual(Compress.on, opts.compress);
+    }
+
+    // --compress=auto still parses the value
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"--compress=off"});
+        try std.testing.expectEqual(Compress.off, opts.compress);
+    }
+}
+
+test "flag_value and no_value together" {
+    const Compress = enum { off, on, auto };
+    const Opts = struct {
+        compress: Compress = .auto,
+
+        pub const meta = .{
+            .compress = .{ .flag_value = .on, .no_value = .off },
+        };
+    };
+
+    // --compress → .on
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"--compress"});
+        try std.testing.expectEqual(Compress.on, opts.compress);
+    }
+
+    // --no-compress → .off
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"--no-compress"});
+        try std.testing.expectEqual(Compress.off, opts.compress);
+    }
+
+    // --compress=auto → .auto
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"--compress=auto"});
+        try std.testing.expectEqual(Compress.auto, opts.compress);
+    }
+}
+
+test "flag_value followed by other flags" {
+    const Compress = enum { off, on, auto };
+    const Opts = struct {
+        compress: Compress = .auto,
+        verbose: bool = false,
+        level: u8 = 1,
+
+        pub const meta = .{
+            .compress = .{ .flag_value = .on },
+            .verbose = .{ .short = 'v' },
+        };
+    };
+
+    // --compress followed by --verbose (not consumed as value)
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{ "--compress", "--verbose" });
+        try std.testing.expectEqual(Compress.on, opts.compress);
+        try std.testing.expect(opts.verbose);
+    }
+
+    // --compress followed by -v (not consumed as value)
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{ "--compress", "-v" });
+        try std.testing.expectEqual(Compress.on, opts.compress);
+        try std.testing.expect(opts.verbose);
+    }
+
+    // --compress at end of args
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"--compress"});
+        try std.testing.expectEqual(Compress.on, opts.compress);
+    }
+
+    // --level still requires value (no flag_value)
+    {
+        var opts = Opts{};
+        const result = parse(Opts, &opts, &.{"--level"});
+        try std.testing.expectError(ParseError.MissingValue, result);
+    }
 }

@@ -42,6 +42,8 @@ pub fn main() !void {
 - **Zero allocations** - everything is comptime or stack-allocated
 - **Short and long options** - `-v` and `--verbose`
 - **Inline values** - `-p8080` and `--port=8080`
+- **Negation with `--no-*`** - `--no-verbose` sets bool to false, `--no-config` sets optional to null
+- **Value-optional flags** - `--compress` alone vs `--compress=gzip` via `flag_value`
 - **Repeatable options** - `Multi(T, capacity)` for `-x foo -x bar`
 - **Subcommands** - `parseMerged` for git-style CLIs
 - **Type support** - strings, integers, bools, enums, optionals
@@ -94,12 +96,13 @@ Fixed-capacity list for repeatable options.
 
 ## Metadata
 
-Optional `meta` decl for short names and help text:
+Optional `meta` decl for short names, help text, and special behaviors:
 
 ```zig
 pub const meta = .{
     .output = .{ .short = 'o', .help = "Output file path" },
     .count = .{ .help = "Number of iterations" },  // no short
+    .compress = .{ .flag_value = .on, .no_value = .off },  // see below
 };
 ```
 
@@ -111,6 +114,50 @@ pub const about = .{
     .desc = "One-line description",
     .usage = "Usage: myapp [options] <file>...",  // optional
 };
+```
+
+## Negation with `--no-*`
+
+The `--no-*` prefix negates options:
+
+| Field type | `--no-flag` behavior |
+|------------|---------------------|
+| `bool` | sets to `false` |
+| `?T` (optional) | sets to `null` |
+| any (with `no_value`) | sets to `no_value` |
+
+```zig
+const Opts = struct {
+    verbose: bool = true,           // --no-verbose → false
+    config: ?[]const u8 = "a.conf", // --no-config → null
+    compress: Compress = .auto,     // --no-compress → .off (via meta)
+
+    pub const meta = .{
+        .compress = .{ .no_value = .off },
+    };
+};
+```
+
+## Value-optional flags with `flag_value`
+
+Some flags work both with and without values (`--compress` vs `--compress=gzip`). Use `flag_value` in meta:
+
+```zig
+const Compress = enum { off, on, auto, gzip, lz4 };
+
+const Opts = struct {
+    compress: Compress = .auto,
+
+    pub const meta = .{
+        .compress = .{ .flag_value = .on, .no_value = .off },
+    };
+};
+
+// Results:
+// (nothing)        → .auto (default)
+// --compress       → .on (flag_value)
+// --compress=gzip  → .gzip (parsed)
+// --no-compress    → .off (no_value)
 ```
 
 ## Subcommands
