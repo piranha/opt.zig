@@ -144,36 +144,49 @@ fn parseInternal(
             return ParseError.UnknownOption;
         }
 
-        // Short option: -x or -xvalue
+        // Short option: -x, -xvalue, or combined -xyz (GNU-style)
         if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
-            const short = arg[1];
-            const inline_value: ?[]const u8 = if (arg.len > 2) arg[2..] else null;
+            var ci: usize = 1;
+            while (ci < arg.len) {
+                const short = arg[ci];
+                const is_bool = isShortBool(G, g_fields, g_has_meta, short) or
+                    (merged and S != void and isShortBool(S, s_fields, s_has_meta, short));
+                const inline_value: ?[]const u8 = if (ci + 1 < arg.len and !is_bool) arg[ci + 1 ..] else null;
 
-            // Try global first, then subcommand
-            const g_result = setFieldByShort(G, g_fields, g_has_meta, global, short, inline_value, args, &i);
-            switch (g_result) {
-                .ok => continue,
-                .missing_value => return ParseError.MissingValue,
-                .invalid_value => return ParseError.InvalidValue,
-                .not_found => {},
-            }
-            if (merged and S != void) {
-                const s_result = setFieldByShort(S, s_fields, s_has_meta, sub, short, inline_value, args, &i);
-                switch (s_result) {
-                    .ok => continue,
+                const g_result = setFieldByShort(G, g_fields, g_has_meta, global, short, inline_value, args, &i);
+                switch (g_result) {
+                    .ok => {
+                        if (inline_value != null) break; // rest consumed as value
+                        ci += 1;
+                        continue;
+                    },
                     .missing_value => return ParseError.MissingValue,
                     .invalid_value => return ParseError.InvalidValue,
                     .not_found => {},
                 }
-            }
-            // In merged mode with empty subcommand struct, skip unknown short options
-            if (merged and s_fields.len == 0) {
-                if (inline_value == null and i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') {
-                    i += 1;
+                if (merged and S != void) {
+                    const s_result = setFieldByShort(S, s_fields, s_has_meta, sub, short, inline_value, args, &i);
+                    switch (s_result) {
+                        .ok => {
+                            if (inline_value != null) break;
+                            ci += 1;
+                            continue;
+                        },
+                        .missing_value => return ParseError.MissingValue,
+                        .invalid_value => return ParseError.InvalidValue,
+                        .not_found => {},
+                    }
                 }
-                continue;
+                // In merged mode with empty subcommand struct, skip unknown short options
+                if (merged and s_fields.len == 0) {
+                    if (inline_value == null and i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') {
+                        i += 1;
+                    }
+                    break;
+                }
+                return ParseError.UnknownOption;
             }
-            return ParseError.UnknownOption;
+            continue;
         }
 
         // Positional
@@ -240,18 +253,28 @@ fn parseInternal(
             continue;
         }
 
-        // Short option - skip it and its value
+        // Short option - skip it and its value (handles combined flags)
         if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
-            const short = arg[1];
-            const has_inline_value = arg.len > 2;
-
-            // Skip next arg if it's the value
-            if (!has_inline_value) {
-                if (needsValueShort(G, g_fields, g_has_meta, short) or
-                    (merged and S != void and needsValueShort(S, s_fields, s_has_meta, short)))
-                {
-                    i += 1;
+            // Walk combined flags; last non-bool consumes rest as inline value
+            var ci: usize = 1;
+            while (ci < arg.len) {
+                const short = arg[ci];
+                const is_bool = isShortBool(G, g_fields, g_has_meta, short) or
+                    (merged and S != void and isShortBool(S, s_fields, s_has_meta, short));
+                if (is_bool) {
+                    ci += 1;
+                    continue;
                 }
+                // Non-bool: rest is inline value if present, else next arg
+                if (ci + 1 >= arg.len) {
+                    // No inline value, skip next arg
+                    if (needsValueShort(G, g_fields, g_has_meta, short) or
+                        (merged and S != void and needsValueShort(S, s_fields, s_has_meta, short)))
+                    {
+                        i += 1;
+                    }
+                }
+                break;
             }
             continue;
         }
@@ -295,6 +318,29 @@ fn needsValue(
             // Optional bool fields don't need a value
             if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return false;
             return true;
+        }
+    }
+    return false;
+}
+
+fn isShortBool(
+    comptime T: type,
+    comptime fields: []const std.builtin.Type.StructField,
+    comptime has_meta: bool,
+    short: u8,
+) bool {
+    if (!has_meta) return false;
+
+    inline for (fields) |field| {
+        if (@hasField(@TypeOf(T.meta), field.name)) {
+            const field_meta = @field(T.meta, field.name);
+            if (@hasField(@TypeOf(field_meta), "short")) {
+                if (field_meta.short == short) {
+                    if (field.type == bool) return true;
+                    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return true;
+                    return false;
+                }
+            }
         }
     }
     return false;
@@ -1192,6 +1238,46 @@ test "custom parse function returning error union" {
     }
 }
 
+test "hyphenated positional not treated as option" {
+    const Opts = struct {
+        exclude: []const u8 = "",
+        verbose: bool = false,
+
+        pub const meta = .{
+            .exclude = .{ .short = 'e', .help = "Exclude pattern" },
+            .verbose = .{ .short = 'v', .help = "Verbose" },
+        };
+    };
+
+    // "metabase-enterprise" contains "-e" but shouldn't trigger the -e short option
+    {
+        var opts = Opts{};
+        const rest = try parse(Opts, &opts, &.{"metabase-enterprise"});
+        try std.testing.expectEqualStrings("", opts.exclude); // -e not triggered
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings("metabase-enterprise", rest[0]);
+    }
+
+    // Same with other options present
+    {
+        var opts = Opts{};
+        const rest = try parse(Opts, &opts, &.{ "-v", "metabase-enterprise" });
+        try std.testing.expect(opts.verbose);
+        try std.testing.expectEqualStrings("", opts.exclude);
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings("metabase-enterprise", rest[0]);
+    }
+
+    // Actual -e flag still works
+    {
+        var opts = Opts{};
+        const rest = try parse(Opts, &opts, &.{ "-e", "pattern", "metabase-enterprise" });
+        try std.testing.expectEqualStrings("pattern", opts.exclude);
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings("metabase-enterprise", rest[0]);
+    }
+}
+
 test "custom parse with --no-* still works" {
     const Opts = struct {
         chmod: ?u16 = 0o755,
@@ -1210,4 +1296,126 @@ test "custom parse with --no-* still works" {
     var opts = Opts{};
     _ = try parse(Opts, &opts, &.{"--no-chmod"});
     try std.testing.expectEqual(@as(?u16, null), opts.chmod);
+}
+
+test "combined short flags GNU-style" {
+    const Opts = struct {
+        verbose: bool = false,
+        debug: bool = false,
+        force: bool = false,
+        name: []const u8 = "default",
+        count: u32 = 0,
+
+        pub const meta = .{
+            .verbose = .{ .short = 'v' },
+            .debug = .{ .short = 'd' },
+            .force = .{ .short = 'f' },
+            .name = .{ .short = 'n' },
+            .count = .{ .short = 'c' },
+        };
+    };
+
+    // Combined bool flags: -vdf
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"-vdf"});
+        try std.testing.expect(opts.verbose);
+        try std.testing.expect(opts.debug);
+        try std.testing.expect(opts.force);
+    }
+
+    // Combined bools followed by value option: -vdn hello
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{ "-vdn", "hello" });
+        try std.testing.expect(opts.verbose);
+        try std.testing.expect(opts.debug);
+        try std.testing.expectEqualStrings("hello", opts.name);
+    }
+
+    // Combined bools with inline value: -vdnhello
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"-vdnhello"});
+        try std.testing.expect(opts.verbose);
+        try std.testing.expect(opts.debug);
+        try std.testing.expectEqualStrings("hello", opts.name);
+    }
+
+    // Value option first consumes rest: -nfoo (name="foo", not -n -f -o -o)
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"-nfoo"});
+        try std.testing.expect(!opts.force); // -f not triggered
+        try std.testing.expectEqualStrings("foo", opts.name);
+    }
+
+    // Combined with positionals
+    {
+        var opts = Opts{};
+        const rest = try parse(Opts, &opts, &.{ "-vf", "file1", "file2" });
+        try std.testing.expect(opts.verbose);
+        try std.testing.expect(opts.force);
+        try std.testing.expectEqual(@as(usize, 2), rest.len);
+        try std.testing.expectEqualStrings("file1", rest[0]);
+    }
+
+    // Single short flag still works
+    {
+        var opts = Opts{};
+        _ = try parse(Opts, &opts, &.{"-v"});
+        try std.testing.expect(opts.verbose);
+        try std.testing.expect(!opts.debug);
+    }
+}
+
+test "combined short flags with parseMerged" {
+    const Global = struct {
+        verbose: bool = false,
+        quiet: bool = false,
+
+        pub const meta = .{
+            .verbose = .{ .short = 'v' },
+            .quiet = .{ .short = 'q' },
+        };
+    };
+
+    const Sub = struct {
+        force: bool = false,
+        interface: []const u8 = "wlan0",
+
+        pub const meta = .{
+            .force = .{ .short = 'f' },
+            .interface = .{ .short = 'i' },
+        };
+    };
+
+    // Combined flags across global and sub: -vf
+    {
+        var global = Global{};
+        var sub = Sub{};
+        _ = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "-vf" });
+        try std.testing.expect(global.verbose);
+        try std.testing.expect(sub.force);
+    }
+
+    // Combined flags with trailing value option: -vfi eth0
+    {
+        var global = Global{};
+        var sub = Sub{};
+        _ = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "-vfi", "eth0" });
+        try std.testing.expect(global.verbose);
+        try std.testing.expect(sub.force);
+        try std.testing.expectEqualStrings("eth0", sub.interface);
+    }
+
+    // Combined with inline value: -vfieth0
+    {
+        var global = Global{};
+        var sub = Sub{};
+        _ = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "-vfieth0" });
+        try std.testing.expect(global.verbose);
+        try std.testing.expect(sub.force);
+        try std.testing.expectEqualStrings("eth0", sub.interface);
+    }
 }
