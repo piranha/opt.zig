@@ -523,8 +523,6 @@ const spaces = "                        "; // 24 spaces
 
 /// Print usage/help for opts struct
 pub fn printUsage(comptime T: type, writer: anytype) void {
-    const fields = @typeInfo(T).@"struct".fields;
-    const has_meta = @hasDecl(T, "meta");
     const has_about = @hasDecl(T, "about");
 
     if (has_about) {
@@ -540,60 +538,7 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
     }
 
     writer.writeAll("Options:\n") catch return;
-
-    inline for (fields) |field| {
-        const short: ?u8 = if (has_meta and @hasField(@TypeOf(T.meta), field.name)) blk: {
-            const m = @field(T.meta, field.name);
-            break :blk if (@hasField(@TypeOf(m), "short")) m.short else null;
-        } else null;
-
-        const help: ?[]const u8 = if (has_meta and @hasField(@TypeOf(T.meta), field.name)) blk: {
-            const m = @field(T.meta, field.name);
-            break :blk if (@hasField(@TypeOf(m), "help")) m.help else null;
-        } else null;
-
-        writer.writeAll("  ") catch return;
-
-        if (short) |s| {
-            writer.print("-{c}, ", .{s}) catch return;
-        } else {
-            writer.writeAll("    ") catch return;
-        }
-
-        writer.writeAll("--") catch return;
-        for (field.name) |c| {
-            writer.writeByte(if (c == '_') '-' else c) catch return;
-        }
-
-        if (field.type != bool) {
-            writer.print(" <{s}>", .{typeName(field.type)}) catch return;
-        }
-
-        const name_len = field.name.len + 2 + (if (field.type != bool) typeName(field.type).len + 3 else 0);
-        const pad = if (name_len < 24) 24 - name_len else 1;
-        writer.writeAll(spaces[0..pad]) catch return;
-
-        if (help) |h| {
-            writer.writeAll(h) catch return;
-        }
-
-        if (field.defaultValue()) |def| {
-            if (field.type == bool) {
-                // skip
-            } else if (field.type == []const u8) {
-                writer.print(" (default: {s})", .{def}) catch return;
-            } else if (@typeInfo(field.type) == .optional) {
-                // skip
-            } else if (@typeInfo(field.type) == .int) {
-                writer.print(" (default: {d})", .{def}) catch return;
-            } else if (@typeInfo(field.type) == .@"enum") {
-                writer.print(" (default: {s})", .{@tagName(def)}) catch return;
-            }
-        }
-
-        writer.writeAll("\n") catch return;
-    }
-
+    printFields(T, writer);
     writer.writeAll("  -h, --help                  Show this help\n") catch return;
 }
 
