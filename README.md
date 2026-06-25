@@ -46,7 +46,7 @@ pub fn main() !void {
 - **Value-optional flags** - `--compress` alone vs `--compress=gzip` via `flag_value`
 - **Custom parsers** - `parse` in meta for octal, special formats, validation
 - **Repeatable options** - `Multi(T, capacity)` for `-x foo -x bar`
-- **Subcommands** - `parseMerged` for git-style CLIs
+- **Subcommands** - `CommandParser` for git-style and nested command CLIs
 - **Type support** - strings, integers, bools, enums, optionals
 
 ## Installation
@@ -75,21 +75,34 @@ exe.root_module.addImport("opt", opt.module("opt"));
 
 Parse args into struct. Returns positional arguments.
 
-### `parseMerged(G, S, *G, *S, args) ![][]const u8`
+### `CommandParser(spec) type`
 
-Parse into two structs (global + subcommand options). First positional is subcommand name.
+Generate a parser for global options plus one or more command levels. Commands and options are defined with normal Zig structs.
 
-### `findSubcmd(E, args) ?E`
+```zig
+const Cli = opt.CommandParser(.{
+    .name = "myapp",
+    .global = GlobalOpts,
+    .commands = .{
+        .build = BuildOpts,
+        .service = .{
+            .options = ServiceOpts,
+            .commands = .{
+                .restart = RestartOpts,
+                .status = StatusOpts,
+            },
+        },
+    },
+});
 
-Find subcommand name in args, return as enum value.
+const parsed = try Cli.parse(args);
+```
+
+The result contains `global`, `command`, `command_name`, `command_index`, and `positionals`.
 
 ### `printUsage(T, writer) void`
 
 Print help text to writer.
-
-### `printMergedUsage(G, S, writer) void`
-
-Print combined help for global + subcommand options.
 
 ### `Multi(T, capacity) type`
 
@@ -206,17 +219,48 @@ const Opts = struct {
 ## Subcommands
 
 ```zig
-const Cmd = enum { build, test, run };
-const Global = struct { verbose: bool = false };
-const BuildOpts = struct { release: bool = false };
+const Global = struct {
+    verbose: bool = false,
+    service: []const u8 = "default",
 
-const cmd = opt.findSubcmd(Cmd, args) orelse return error.NoCommand;
-switch (cmd) {
-    .build => {
-        var global = Global{};
-        var build_opts = BuildOpts{};
-        const rest = try opt.parseMerged(Global, BuildOpts, &global, &build_opts, args);
+    pub const meta = .{
+        .verbose = .{ .short = 'v' },
+        .service = .{ .short = 's', .help = "Service name" },
+    };
+};
+
+const BuildOpts = struct { release: bool = false };
+const RestartOpts = struct { force: bool = false };
+const StatusOpts = struct {};
+const ServiceOpts = struct { name: []const u8 = "cam" };
+
+const Cli = opt.CommandParser(.{
+    .name = "myapp",
+    .global = Global,
+    .commands = .{
+        .build = BuildOpts,
+        .service = .{
+            .options = ServiceOpts,
+            .commands = .{
+                .restart = RestartOpts,
+                .status = StatusOpts,
+            },
+        },
     },
-    // ...
+});
+
+const parsed = try Cli.parse(args);
+switch (parsed.command) {
+    .build => |build| try runBuild(parsed.global, build, parsed.positionals),
+    .service => |service| switch (service.command) {
+        .restart => |restart| try restartService(parsed.global, service.options, restart),
+        .status => |status| try serviceStatus(parsed.global, service.options, status),
+    },
 }
+```
+
+Command discovery is option-schema aware, so valued options before commands work:
+
+```sh
+myapp --service cam service restart
 ```

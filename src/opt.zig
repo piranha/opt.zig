@@ -27,6 +27,8 @@ pub const ParseError = error{
     MissingValue,
     InvalidValue,
     UnknownOption,
+    MissingCommand,
+    UnknownCommand,
     Help,
     OutOfMemory,
     TooManyValues,
@@ -34,70 +36,34 @@ pub const ParseError = error{
 
 /// Parse args into opts struct. Returns remaining positional args.
 pub fn parse(comptime T: type, opts: *T, args: []const []const u8) ParseError![]const []const u8 {
-    return parseInternal(T, void, opts, undefined, args, false);
-}
-
-/// Parse args into two structs (global + subcommand). Options can appear anywhere.
-/// First positional is subcommand name (skipped). Returns remaining positional args.
-pub fn parseMerged(
-    comptime G: type,
-    comptime S: type,
-    global: *G,
-    sub: *S,
-    args: []const []const u8,
-) ParseError![]const []const u8 {
-    return parseInternal(G, S, global, sub, args, true);
-}
-
-fn parseInternal(
-    comptime G: type,
-    comptime S: type,
-    global: *G,
-    sub: anytype,
-    args: []const []const u8,
-    comptime merged: bool,
-) ParseError![]const []const u8 {
-    const g_fields = @typeInfo(G).@"struct".fields;
-    const g_has_meta = @hasDecl(G, "meta");
-    const s_fields = if (S != void) @typeInfo(S).@"struct".fields else &[_]std.builtin.Type.StructField{};
-    const s_has_meta = if (S != void) @hasDecl(S, "meta") else false;
+    const fields = @typeInfo(T).@"struct".fields;
+    const has_meta = @hasDecl(T, "meta");
 
     var i: usize = 0;
-    var found_subcmd = false;
-    var positional_count: usize = 0;
     var stop_parsing_options = false;
 
-    // First pass: count positionals and parse options
+    // First pass: parse options.
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-
         if (arg.len == 0) continue;
 
-        // After --, everything is positional
-        if (stop_parsing_options) {
-            positional_count += 1;
-            continue;
-        }
+        if (stop_parsing_options) continue;
 
-        // Help flag
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return ParseError.Help;
         }
 
-        // End of options marker - everything after is positional
         if (std.mem.eql(u8, arg, "--")) {
             stop_parsing_options = true;
             continue;
         }
 
-        // Long option: --name or --name=value or --no-name
         if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
             const rest = arg[2..];
             var name: []const u8 = rest;
             var inline_value: ?[]const u8 = null;
             var is_negated = false;
 
-            // Check for --no-* prefix
             if (rest.len > 3 and std.mem.startsWith(u8, rest, "no-")) {
                 is_negated = true;
                 name = rest[3..];
@@ -111,122 +77,66 @@ fn parseInternal(
             var name_buf: [64]u8 = undefined;
             const norm_name = normalizeName(name, &name_buf);
 
-            // Try global first, then subcommand
-            const g_result = if (is_negated)
-                setFieldNegated(G, g_fields, g_has_meta, global, norm_name)
+            const result = if (is_negated)
+                setFieldNegated(T, fields, has_meta, opts, norm_name)
             else
-                setField(G, g_fields, g_has_meta, global, norm_name, inline_value, args, &i);
-            switch (g_result) {
+                setField(T, fields, has_meta, opts, norm_name, inline_value, args, &i);
+            switch (result) {
                 .ok => continue,
                 .missing_value => return ParseError.MissingValue,
                 .invalid_value => return ParseError.InvalidValue,
-                .not_found => {},
+                .not_found => return ParseError.UnknownOption,
             }
-            if (merged and S != void) {
-                const s_result = if (is_negated)
-                    setFieldNegated(S, s_fields, s_has_meta, sub, norm_name)
-                else
-                    setField(S, s_fields, s_has_meta, sub, norm_name, inline_value, args, &i);
-                switch (s_result) {
-                    .ok => continue,
-                    .missing_value => return ParseError.MissingValue,
-                    .invalid_value => return ParseError.InvalidValue,
-                    .not_found => {},
-                }
-            }
-            // In merged mode with empty subcommand struct, skip unknown options
-            if (merged and s_fields.len == 0) {
-                if (inline_value == null and i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') {
-                    i += 1;
-                }
-                continue;
-            }
-            return ParseError.UnknownOption;
         }
 
-        // Short option: -x, -xvalue, or combined -xyz (GNU-style)
         if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
             var ci: usize = 1;
             while (ci < arg.len) {
                 const short = arg[ci];
-                const is_bool = isShortBool(G, g_fields, g_has_meta, short) or
-                    (merged and S != void and isShortBool(S, s_fields, s_has_meta, short));
+                const is_bool = isShortBool(T, fields, has_meta, short);
                 const inline_value: ?[]const u8 = if (ci + 1 < arg.len and !is_bool) arg[ci + 1 ..] else null;
 
-                const g_result = setFieldByShort(G, g_fields, g_has_meta, global, short, inline_value, args, &i);
-                switch (g_result) {
+                const result = setFieldByShort(T, fields, has_meta, opts, short, inline_value, args, &i);
+                switch (result) {
                     .ok => {
-                        if (inline_value != null) break; // rest consumed as value
+                        if (inline_value != null) break;
                         ci += 1;
                         continue;
                     },
                     .missing_value => return ParseError.MissingValue,
                     .invalid_value => return ParseError.InvalidValue,
-                    .not_found => {},
+                    .not_found => return ParseError.UnknownOption,
                 }
-                if (merged and S != void) {
-                    const s_result = setFieldByShort(S, s_fields, s_has_meta, sub, short, inline_value, args, &i);
-                    switch (s_result) {
-                        .ok => {
-                            if (inline_value != null) break;
-                            ci += 1;
-                            continue;
-                        },
-                        .missing_value => return ParseError.MissingValue,
-                        .invalid_value => return ParseError.InvalidValue,
-                        .not_found => {},
-                    }
-                }
-                // In merged mode with empty subcommand struct, skip unknown short options
-                if (merged and s_fields.len == 0) {
-                    if (inline_value == null and i + 1 < args.len and args[i + 1].len > 0 and args[i + 1][0] != '-') {
-                        i += 1;
-                    }
-                    break;
-                }
-                return ParseError.UnknownOption;
             }
             continue;
         }
-
-        // Positional
-        if (merged and !found_subcmd) {
-            found_subcmd = true;
-            continue;
-        }
-        positional_count += 1;
     }
 
-    // Second pass: collect positionals into buffer using thread-local storage
-    const S2 = struct {
+    // Second pass: collect positionals into buffer using thread-local storage.
+    const S = struct {
         threadlocal var positional_buf: [256][]const u8 = undefined;
     };
 
     var pos_idx: usize = 0;
     i = 0;
-    found_subcmd = false;
     stop_parsing_options = false;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-
         if (arg.len == 0) continue;
 
-        // After --, everything is positional
         if (stop_parsing_options) {
             if (pos_idx < 256) {
-                S2.positional_buf[pos_idx] = arg;
+                S.positional_buf[pos_idx] = arg;
                 pos_idx += 1;
             }
             continue;
         }
 
-        // End of options marker
         if (std.mem.eql(u8, arg, "--")) {
             stop_parsing_options = true;
             continue;
         }
 
-        // Long option - skip it and its value
         if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
             const rest = arg[2..];
             var name: []const u8 = rest;
@@ -240,57 +150,40 @@ fn parseInternal(
                 has_inline_value = true;
             }
 
-            // Skip next arg if it's the value (non-bool option without inline value)
             if (!has_inline_value) {
                 var name_buf: [64]u8 = undefined;
                 const norm_name = normalizeName(name, &name_buf);
-                if (needsValue(G, g_fields, g_has_meta, norm_name) or
-                    (merged and S != void and needsValue(S, s_fields, s_has_meta, norm_name)))
-                {
+                if (needsValue(T, fields, has_meta, norm_name)) {
                     i += 1;
                 }
             }
             continue;
         }
 
-        // Short option - skip it and its value (handles combined flags)
         if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
-            // Walk combined flags; last non-bool consumes rest as inline value
             var ci: usize = 1;
             while (ci < arg.len) {
                 const short = arg[ci];
-                const is_bool = isShortBool(G, g_fields, g_has_meta, short) or
-                    (merged and S != void and isShortBool(S, s_fields, s_has_meta, short));
+                const is_bool = isShortBool(T, fields, has_meta, short);
                 if (is_bool) {
                     ci += 1;
                     continue;
                 }
-                // Non-bool: rest is inline value if present, else next arg
-                if (ci + 1 >= arg.len) {
-                    // No inline value, skip next arg
-                    if (needsValueShort(G, g_fields, g_has_meta, short) or
-                        (merged and S != void and needsValueShort(S, s_fields, s_has_meta, short)))
-                    {
-                        i += 1;
-                    }
+                if (ci + 1 >= arg.len and needsValueShort(T, fields, has_meta, short)) {
+                    i += 1;
                 }
                 break;
             }
             continue;
         }
 
-        // Positional
-        if (merged and !found_subcmd) {
-            found_subcmd = true;
-            continue;
-        }
         if (pos_idx < 256) {
-            S2.positional_buf[pos_idx] = arg;
+            S.positional_buf[pos_idx] = arg;
             pos_idx += 1;
         }
     }
 
-    return S2.positional_buf[0..pos_idx];
+    return S.positional_buf[0..pos_idx];
 }
 
 fn normalizeName(name: []const u8, buf: []u8) []const u8 {
@@ -303,24 +196,60 @@ fn normalizeName(name: []const u8, buf: []u8) []const u8 {
     return buf[0..j];
 }
 
+const OptionArity = enum { flag, value };
+
+fn fieldArity(comptime field: std.builtin.Type.StructField) OptionArity {
+    if (field.type == bool) return .flag;
+    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return .flag;
+    return .value;
+}
+
+fn longOptionArity(
+    comptime T: type,
+    comptime fields: []const std.builtin.Type.StructField,
+    comptime has_meta: bool,
+    name: []const u8,
+) ?OptionArity {
+    _ = T;
+    _ = has_meta;
+    inline for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return fieldArity(field);
+    }
+    return null;
+}
+
+fn shortOptionArity(
+    comptime T: type,
+    comptime fields: []const std.builtin.Type.StructField,
+    comptime has_meta: bool,
+    short: u8,
+) ?OptionArity {
+    if (!has_meta) return null;
+
+    inline for (fields) |field| {
+        if (@hasField(@TypeOf(T.meta), field.name)) {
+            const field_meta = @field(T.meta, field.name);
+            if (@hasField(@TypeOf(field_meta), "short") and field_meta.short == short) {
+                return fieldArity(field);
+            }
+        }
+    }
+    return null;
+}
+
+fn combineArity(a: ?OptionArity, b: ?OptionArity) ?OptionArity {
+    if (a == .value or b == .value) return .value;
+    if (a != null or b != null) return .flag;
+    return null;
+}
+
 fn needsValue(
     comptime T: type,
     comptime fields: []const std.builtin.Type.StructField,
     comptime has_meta: bool,
     name: []const u8,
 ) bool {
-    _ = T;
-    _ = has_meta;
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) {
-            // Bool fields don't need a value
-            if (field.type == bool) return false;
-            // Optional bool fields don't need a value
-            if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return false;
-            return true;
-        }
-    }
-    return false;
+    return longOptionArity(T, fields, has_meta, name) == .value;
 }
 
 fn isShortBool(
@@ -329,21 +258,7 @@ fn isShortBool(
     comptime has_meta: bool,
     short: u8,
 ) bool {
-    if (!has_meta) return false;
-
-    inline for (fields) |field| {
-        if (@hasField(@TypeOf(T.meta), field.name)) {
-            const field_meta = @field(T.meta, field.name);
-            if (@hasField(@TypeOf(field_meta), "short")) {
-                if (field_meta.short == short) {
-                    if (field.type == bool) return true;
-                    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return true;
-                    return false;
-                }
-            }
-        }
-    }
-    return false;
+    return shortOptionArity(T, fields, has_meta, short) == .flag;
 }
 
 fn needsValueShort(
@@ -352,23 +267,7 @@ fn needsValueShort(
     comptime has_meta: bool,
     short: u8,
 ) bool {
-    if (!has_meta) return false;
-
-    inline for (fields) |field| {
-        if (@hasField(@TypeOf(T.meta), field.name)) {
-            const field_meta = @field(T.meta, field.name);
-            if (@hasField(@TypeOf(field_meta), "short")) {
-                if (field_meta.short == short) {
-                    // Bool fields don't need a value
-                    if (field.type == bool) return false;
-                    // Optional bool fields don't need a value
-                    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return false;
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
+    return shortOptionArity(T, fields, has_meta, short) == .value;
 }
 
 const FieldResult = enum { not_found, ok, missing_value, invalid_value };
@@ -704,35 +603,466 @@ fn typeName(comptime T: type) [:0]const u8 {
     return "?";
 }
 
-/// Find subcommand name (first positional arg)
-pub fn findSubcmd(comptime E: type, args: []const []const u8) ?E {
-    for (args) |arg| {
-        if (arg.len > 0 and arg[0] != '-') {
-            return std.meta.stringToEnum(E, arg);
-        }
-    }
-    return null;
+fn commandPayloadType(comptime command_spec: anytype) type {
+    if (comptime @TypeOf(command_spec) == type) return command_spec;
+    return struct {
+        options: command_spec.options,
+        command_name: []const u8,
+        command_index: usize,
+        command: commandUnion(@field(command_spec, "commands")),
+    };
 }
 
-/// Print merged usage (global + subcommand opts)
-pub fn printMergedUsage(comptime G: type, comptime S: type, writer: anytype) void {
-    const has_about = @hasDecl(S, "about");
+fn commandUnion(comptime commands: anytype) type {
+    const fields_info = @typeInfo(@TypeOf(commands)).@"struct".fields;
+    comptime var enum_fields: [fields_info.len]std.builtin.Type.EnumField = undefined;
+    comptime var union_fields: [fields_info.len]std.builtin.Type.UnionField = undefined;
 
-    if (has_about) {
-        writer.print("{s}", .{S.about.name}) catch return;
-        if (@hasField(@TypeOf(S.about), "desc")) {
-            writer.print(" - {s}", .{S.about.desc}) catch return;
-        }
-        writer.writeAll("\n\n") catch return;
+    inline for (fields_info, 0..) |field, idx| {
+        const command_spec = @field(commands, field.name);
+        enum_fields[idx] = .{ .name = field.name, .value = idx };
+        union_fields[idx] = .{
+            .name = field.name,
+            .type = commandPayloadType(command_spec),
+            .alignment = @alignOf(commandPayloadType(command_spec)),
+        };
     }
 
-    writer.writeAll("Options:\n") catch return;
-    printFields(S, writer);
+    const Tag = @Type(.{ .@"enum" = .{
+        .tag_type = std.math.IntFittingRange(0, fields_info.len - 1),
+        .fields = &enum_fields,
+        .decls = &.{},
+        .is_exhaustive = true,
+    } });
 
-    writer.writeAll("\nGlobal options:\n") catch return;
-    printFields(G, writer);
+    return @Type(.{ .@"union" = .{
+        .layout = .auto,
+        .tag_type = Tag,
+        .fields = &union_fields,
+        .decls = &.{},
+    } });
+}
 
-    writer.writeAll("  -h, --help              Show this help\n") catch return;
+fn commandFound(comptime commands: anytype) type {
+    return struct {
+        command: commandUnion(commands),
+        command_name: []const u8,
+        command_index: usize,
+    };
+}
+
+fn commandNameMatches(field_name: []const u8, arg: []const u8) bool {
+    if (field_name.len != arg.len) return false;
+    for (field_name, arg) |f, a| {
+        const normalized = if (f == '_') '-' else f;
+        if (normalized != a) return false;
+    }
+    return true;
+}
+
+fn commandSpecIsBranch(comptime command_spec: anytype) bool {
+    return @TypeOf(command_spec) != type;
+}
+
+fn commandSpecOptions(comptime command_spec: anytype) type {
+    return if (commandSpecIsBranch(command_spec)) command_spec.options else command_spec;
+}
+
+fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?OptionArity {
+    var arity: ?OptionArity = null;
+    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
+        const command_spec = @field(commands, field.name);
+        const Opts = commandSpecOptions(command_spec);
+        const opt_fields = @typeInfo(Opts).@"struct".fields;
+        const has_meta = @hasDecl(Opts, "meta");
+        arity = combineArity(arity, longOptionArity(Opts, opt_fields, has_meta, name));
+        if (arity == .value) return .value;
+        if (comptime commandSpecIsBranch(command_spec)) {
+            arity = combineArity(arity, longArityInCommandTree(command_spec.commands, name));
+            if (arity == .value) return .value;
+        }
+    }
+    return arity;
+}
+
+fn shortArityInCommandTree(comptime commands: anytype, short: u8) ?OptionArity {
+    var arity: ?OptionArity = null;
+    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
+        const command_spec = @field(commands, field.name);
+        const Opts = commandSpecOptions(command_spec);
+        const opt_fields = @typeInfo(Opts).@"struct".fields;
+        const has_meta = @hasDecl(Opts, "meta");
+        arity = combineArity(arity, shortOptionArity(Opts, opt_fields, has_meta, short));
+        if (arity == .value) return .value;
+        if (comptime commandSpecIsBranch(command_spec)) {
+            arity = combineArity(arity, shortArityInCommandTree(command_spec.commands, short));
+            if (arity == .value) return .value;
+        }
+    }
+    return arity;
+}
+
+fn shortArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), short: u8) ?OptionArity {
+    switch (command.*) {
+        inline else => |*payload, tag| {
+            const command_spec = @field(commands, @tagName(tag));
+            const Opts = commandSpecOptions(command_spec);
+            const opt_fields = @typeInfo(Opts).@"struct".fields;
+            const has_meta = @hasDecl(Opts, "meta");
+            var arity = shortOptionArity(Opts, opt_fields, has_meta, short);
+            if (comptime commandSpecIsBranch(command_spec)) {
+                arity = combineArity(arity, shortArityInSelectedCommand(command_spec.commands, &payload.command, short));
+            }
+            return arity;
+        },
+    }
+}
+
+fn selectedCommandIndex(comptime commands: anytype, command: *const commandUnion(commands), root_index: usize, idx: usize) bool {
+    if (idx == root_index) return true;
+    switch (command.*) {
+        inline else => |*payload, tag| {
+            const command_spec = @field(commands, @tagName(tag));
+            if (comptime commandSpecIsBranch(command_spec)) {
+                if (idx == payload.command_index) return true;
+                return selectedCommandIndex(command_spec.commands, &payload.command, payload.command_index, idx);
+            }
+            return false;
+        },
+    }
+}
+
+fn setLongInSelectedCommand(
+    comptime commands: anytype,
+    command: *commandUnion(commands),
+    name: []const u8,
+    is_negated: bool,
+    inline_value: ?[]const u8,
+    args: []const []const u8,
+    i: *usize,
+) FieldResult {
+    switch (command.*) {
+        inline else => |*payload, tag| {
+            const command_spec = @field(commands, @tagName(tag));
+            const Opts = commandSpecOptions(command_spec);
+            const fields = @typeInfo(Opts).@"struct".fields;
+            const has_meta = @hasDecl(Opts, "meta");
+            const result = if (is_negated)
+                setFieldNegated(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name)
+            else
+                setField(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name, inline_value, args, i);
+            switch (result) {
+                .ok, .missing_value, .invalid_value => return result,
+                .not_found => {},
+            }
+            if (comptime commandSpecIsBranch(command_spec)) {
+                return setLongInSelectedCommand(command_spec.commands, &payload.command, name, is_negated, inline_value, args, i);
+            }
+            return .not_found;
+        },
+    }
+}
+
+fn setShortInSelectedCommand(
+    comptime commands: anytype,
+    command: *commandUnion(commands),
+    short: u8,
+    inline_value: ?[]const u8,
+    args: []const []const u8,
+    i: *usize,
+) FieldResult {
+    switch (command.*) {
+        inline else => |*payload, tag| {
+            const command_spec = @field(commands, @tagName(tag));
+            const Opts = commandSpecOptions(command_spec);
+            const fields = @typeInfo(Opts).@"struct".fields;
+            const has_meta = @hasDecl(Opts, "meta");
+            const result = setFieldByShort(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, short, inline_value, args, i);
+            switch (result) {
+                .ok, .missing_value, .invalid_value => return result,
+                .not_found => {},
+            }
+            if (comptime commandSpecIsBranch(command_spec)) {
+                return setShortInSelectedCommand(command_spec.commands, &payload.command, short, inline_value, args, i);
+            }
+            return .not_found;
+        },
+    }
+}
+
+fn discoverCommand(
+    comptime G: type,
+    comptime Scope: type,
+    comptime commands: anytype,
+    args: []const []const u8,
+    start_index: usize,
+) ParseError!commandFound(commands) {
+    const g_fields = @typeInfo(G).@"struct".fields;
+    const g_has_meta = @hasDecl(G, "meta");
+    const scope_fields = if (Scope != void) @typeInfo(Scope).@"struct".fields else &[_]std.builtin.Type.StructField{};
+    const scope_has_meta = if (Scope != void) @hasDecl(Scope, "meta") else false;
+    const command_fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
+
+    var i = start_index;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len == 0) continue;
+
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            return ParseError.Help;
+        }
+
+        if (std.mem.eql(u8, arg, "--")) {
+            return ParseError.MissingCommand;
+        }
+
+        if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
+            const rest = arg[2..];
+            var name: []const u8 = rest;
+            var has_inline_value = false;
+            if (rest.len > 3 and std.mem.startsWith(u8, rest, "no-")) {
+                name = rest[3..];
+            }
+            if (std.mem.indexOf(u8, name, "=")) |eq| {
+                name = name[0..eq];
+                has_inline_value = true;
+            }
+            var name_buf: [64]u8 = undefined;
+            const norm_name = normalizeName(name, &name_buf);
+            if (!has_inline_value and (longOptionArity(G, g_fields, g_has_meta, norm_name) == .value or
+                (Scope != void and longOptionArity(Scope, scope_fields, scope_has_meta, norm_name) == .value) or
+                longArityInCommandTree(commands, norm_name) == .value))
+            {
+                if (i + 1 < args.len) i += 1;
+            }
+            continue;
+        }
+
+        if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+            var ci: usize = 1;
+            while (ci < arg.len) {
+                const short = arg[ci];
+                const short_arity = combineArity(
+                    combineArity(shortOptionArity(G, g_fields, g_has_meta, short), if (Scope != void) shortOptionArity(Scope, scope_fields, scope_has_meta, short) else null),
+                    shortArityInCommandTree(commands, short),
+                );
+                const is_bool = short_arity == .flag;
+                if (is_bool) {
+                    ci += 1;
+                    continue;
+                }
+                if (ci + 1 >= arg.len and short_arity == .value) {
+                    if (i + 1 < args.len) i += 1;
+                }
+                break;
+            }
+            continue;
+        }
+
+        inline for (command_fields) |field| {
+            if (commandNameMatches(field.name, arg)) {
+                const command_spec = @field(commands, field.name);
+                if (comptime commandSpecIsBranch(command_spec)) {
+                    const child = try discoverCommand(G, command_spec.options, command_spec.commands, args, i + 1);
+                    const payload: commandPayloadType(command_spec) = .{
+                        .options = command_spec.options{},
+                        .command_name = child.command_name,
+                        .command_index = child.command_index,
+                        .command = child.command,
+                    };
+                    return .{
+                        .command = @unionInit(commandUnion(commands), field.name, payload),
+                        .command_name = arg,
+                        .command_index = i,
+                    };
+                } else {
+                    return .{
+                        .command = @unionInit(commandUnion(commands), field.name, command_spec{}),
+                        .command_name = arg,
+                        .command_index = i,
+                    };
+                }
+            }
+        }
+        return ParseError.UnknownCommand;
+    }
+
+    return ParseError.MissingCommand;
+}
+
+fn parseSelectedCommand(
+    comptime G: type,
+    comptime commands: anytype,
+    global: *G,
+    command: *commandUnion(commands),
+    root_command_index: usize,
+    args: []const []const u8,
+) ParseError![]const []const u8 {
+    const g_fields = @typeInfo(G).@"struct".fields;
+    const g_has_meta = @hasDecl(G, "meta");
+
+    const S = struct {
+        threadlocal var positional_buf: [256][]const u8 = undefined;
+    };
+
+    var pos_idx: usize = 0;
+    var i: usize = 0;
+    var stop_parsing_options = false;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len == 0) continue;
+
+        if (selectedCommandIndex(commands, command, root_command_index, i)) continue;
+
+        if (stop_parsing_options) {
+            if (pos_idx < 256) {
+                S.positional_buf[pos_idx] = arg;
+                pos_idx += 1;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            return ParseError.Help;
+        }
+
+        if (std.mem.eql(u8, arg, "--")) {
+            stop_parsing_options = true;
+            continue;
+        }
+
+        if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
+            const rest = arg[2..];
+            var name: []const u8 = rest;
+            var inline_value: ?[]const u8 = null;
+            var is_negated = false;
+
+            if (rest.len > 3 and std.mem.startsWith(u8, rest, "no-")) {
+                is_negated = true;
+                name = rest[3..];
+            }
+
+            if (std.mem.indexOf(u8, name, "=")) |eq| {
+                inline_value = name[eq + 1 ..];
+                name = name[0..eq];
+            }
+
+            var name_buf: [64]u8 = undefined;
+            const norm_name = normalizeName(name, &name_buf);
+
+            const g_result = if (is_negated)
+                setFieldNegated(G, g_fields, g_has_meta, global, norm_name)
+            else
+                setField(G, g_fields, g_has_meta, global, norm_name, inline_value, args, &i);
+            switch (g_result) {
+                .ok => continue,
+                .missing_value => return ParseError.MissingValue,
+                .invalid_value => return ParseError.InvalidValue,
+                .not_found => {},
+            }
+
+            const c_result = setLongInSelectedCommand(commands, command, norm_name, is_negated, inline_value, args, &i);
+            switch (c_result) {
+                .ok => continue,
+                .missing_value => return ParseError.MissingValue,
+                .invalid_value => return ParseError.InvalidValue,
+                .not_found => return ParseError.UnknownOption,
+            }
+        }
+
+        if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
+            var ci: usize = 1;
+            while (ci < arg.len) {
+                const short = arg[ci];
+                const short_arity = combineArity(shortOptionArity(G, g_fields, g_has_meta, short), shortArityInSelectedCommand(commands, command, short));
+                const is_bool = short_arity == .flag;
+                const inline_value: ?[]const u8 = if (ci + 1 < arg.len and !is_bool) arg[ci + 1 ..] else null;
+
+                const g_result = setFieldByShort(G, g_fields, g_has_meta, global, short, inline_value, args, &i);
+                switch (g_result) {
+                    .ok => {
+                        if (inline_value != null) break;
+                        ci += 1;
+                        continue;
+                    },
+                    .missing_value => return ParseError.MissingValue,
+                    .invalid_value => return ParseError.InvalidValue,
+                    .not_found => {},
+                }
+
+                const c_result = setShortInSelectedCommand(commands, command, short, inline_value, args, &i);
+                switch (c_result) {
+                    .ok => {
+                        if (inline_value != null) break;
+                        ci += 1;
+                        continue;
+                    },
+                    .missing_value => return ParseError.MissingValue,
+                    .invalid_value => return ParseError.InvalidValue,
+                    .not_found => return ParseError.UnknownOption,
+                }
+            }
+            continue;
+        }
+
+        if (pos_idx < 256) {
+            S.positional_buf[pos_idx] = arg;
+            pos_idx += 1;
+        }
+    }
+
+    return S.positional_buf[0..pos_idx];
+}
+
+pub fn CommandParser(comptime spec: anytype) type {
+    return struct {
+        const Self = @This();
+
+        pub const Global = spec.global;
+        pub const Command = commandUnion(spec.commands);
+
+        pub const Result = struct {
+            global: Global,
+            command: Command,
+            command_name: []const u8,
+            command_index: usize,
+            positionals: []const []const u8,
+        };
+
+        pub fn parse(args: []const []const u8) ParseError!Result {
+            var global = Global{};
+            var found = try discoverCommand(Global, void, spec.commands, args, 0);
+            const positionals = try parseSelectedCommand(Global, spec.commands, &global, &found.command, found.command_index, args);
+            return .{
+                .global = global,
+                .command = found.command,
+                .command_name = found.command_name,
+                .command_index = found.command_index,
+                .positionals = positionals,
+            };
+        }
+
+        pub fn printUsage(writer: anytype) void {
+            if (@hasField(@TypeOf(spec), "name")) {
+                writer.print("Usage: {s} <command> [options]\n\n", .{spec.name}) catch return;
+            }
+            writer.writeAll("Commands:\n") catch return;
+            inline for (@typeInfo(@TypeOf(spec.commands)).@"struct".fields) |field| {
+                writer.print("  {s}\n", .{field.name}) catch return;
+            }
+            writer.writeAll("\nGlobal options:\n") catch return;
+            printFields(Global, writer);
+        }
+
+        pub fn printCommandUsage(comptime tag: std.meta.Tag(Command), writer: anytype) void {
+            const command_spec = @field(spec.commands, @tagName(tag));
+            if (comptime commandSpecIsBranch(command_spec)) {
+                printFields(command_spec.options, writer);
+            } else {
+                printFields(command_spec, writer);
+            }
+        }
+    };
 }
 
 fn printFields(comptime T: type, writer: anytype) void {
@@ -904,77 +1234,105 @@ test "enum field" {
     try std.testing.expectEqual(Mode.fast, opts.mode);
 }
 
-test "findSubcmd" {
-    const Cmd = enum { tx, rx, drone, gs };
+test "CommandParser finds command after valued global option" {
+    const Global = struct {
+        service: []const u8 = "default",
+        verbose: bool = false,
 
-    try std.testing.expectEqual(Cmd.tx, findSubcmd(Cmd, &.{ "-v", "tx", "-i", "wlan0" }));
-    try std.testing.expectEqual(Cmd.rx, findSubcmd(Cmd, &.{"rx"}));
-    try std.testing.expectEqual(null, findSubcmd(Cmd, &.{ "-v", "--quiet" }));
-    try std.testing.expectEqual(null, findSubcmd(Cmd, &.{"unknown"}));
+        pub const meta = .{
+            .service = .{ .short = 's', .help = "Service" },
+            .verbose = .{ .short = 'v', .help = "Verbose" },
+        };
+    };
+    const Restart = struct {
+        force: bool = false,
+
+        pub const meta = .{ .force = .{ .short = 'f', .help = "Force" } };
+    };
+    const Status = struct {};
+
+    const Cli = CommandParser(.{
+        .name = "zctl",
+        .global = Global,
+        .commands = .{
+            .restart = Restart,
+            .status = Status,
+        },
+    });
+
+    const parsed = try Cli.parse(&.{ "--service", "cam", "restart", "--force", "pos" });
+    try std.testing.expectEqualStrings("cam", parsed.global.service);
+    try std.testing.expectEqualStrings("restart", parsed.command_name);
+    try std.testing.expectEqual(@as(usize, 2), parsed.command_index);
+    switch (parsed.command) {
+        .restart => |restart| try std.testing.expect(restart.force),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(@as(usize, 1), parsed.positionals.len);
+    try std.testing.expectEqualStrings("pos", parsed.positionals[0]);
+
+    const combined = try Cli.parse(&.{ "restart", "-vf" });
+    try std.testing.expect(combined.global.verbose);
+    try std.testing.expect(combined.command.restart.force);
+
+    const stopped = try Cli.parse(&.{ "restart", "--", "--force", "pos" });
+    try std.testing.expect(!stopped.command.restart.force);
+    try std.testing.expectEqual(@as(usize, 2), stopped.positionals.len);
+    try std.testing.expectEqualStrings("--force", stopped.positionals[0]);
+    try std.testing.expectEqualStrings("pos", stopped.positionals[1]);
+
+    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "--", "restart" }));
+    try std.testing.expectError(ParseError.Help, Cli.parse(&.{"--help"}));
 }
 
-test "parseMerged global opts anywhere" {
+test "CommandParser supports nested command groups" {
     const Global = struct {
         verbose: bool = false,
-        quiet: bool = false,
-
-        pub const meta = .{
-            .verbose = .{ .short = 'v', .help = "Verbose" },
-            .quiet = .{ .short = 'q', .help = "Quiet" },
-        };
+        pub const meta = .{ .verbose = .{ .short = 'v' } };
     };
-
-    const TxOpts = struct {
-        interface: []const u8 = "wlan0",
-        port: u16 = 5600,
-
-        pub const meta = .{
-            .interface = .{ .short = 'i', .help = "Interface" },
-            .port = .{ .short = 'p', .help = "Port" },
-        };
+    const Service = struct {
+        name: []const u8 = "default",
+        pub const meta = .{ .name = .{ .short = 'n' } };
     };
+    const Restart = struct {
+        force: bool = false,
+        pub const meta = .{ .force = .{ .short = 'f' } };
+    };
+    const Status = struct {};
 
-    // Global before subcommand
-    {
-        var global = Global{};
-        var sub = TxOpts{};
-        _ = try parseMerged(Global, TxOpts, &global, &sub, &.{ "-v", "tx", "-i", "wlan1" });
-        try std.testing.expect(global.verbose);
-        try std.testing.expectEqualStrings("wlan1", sub.interface);
+    const Cli = CommandParser(.{
+        .name = "app",
+        .global = Global,
+        .commands = .{
+            .service = .{
+                .options = Service,
+                .commands = .{
+                    .restart = Restart,
+                    .status = Status,
+                },
+            },
+        },
+    });
+
+    const parsed = try Cli.parse(&.{ "--verbose", "service", "--name", "cam", "restart", "--force", "pos1" });
+    try std.testing.expect(parsed.global.verbose);
+    try std.testing.expectEqualStrings("service", parsed.command_name);
+    try std.testing.expectEqual(@as(usize, 1), parsed.command_index);
+    switch (parsed.command) {
+        .service => |service| {
+            try std.testing.expectEqualStrings("cam", service.options.name);
+            try std.testing.expectEqualStrings("restart", service.command_name);
+            try std.testing.expectEqual(@as(usize, 4), service.command_index);
+            switch (service.command) {
+                .restart => |restart| try std.testing.expect(restart.force),
+                else => return error.TestExpectedEqual,
+            }
+        },
     }
+    try std.testing.expectEqual(@as(usize, 1), parsed.positionals.len);
+    try std.testing.expectEqualStrings("pos1", parsed.positionals[0]);
 
-    // Global after subcommand
-    {
-        var global = Global{};
-        var sub = TxOpts{};
-        _ = try parseMerged(Global, TxOpts, &global, &sub, &.{ "tx", "-i", "wlan1", "-v" });
-        try std.testing.expect(global.verbose);
-        try std.testing.expectEqualStrings("wlan1", sub.interface);
-    }
-
-    // Mixed order
-    {
-        var global = Global{};
-        var sub = TxOpts{};
-        _ = try parseMerged(Global, TxOpts, &global, &sub, &.{ "tx", "-v", "-i", "wlan1", "--quiet", "-p", "1234" });
-        try std.testing.expect(global.verbose);
-        try std.testing.expect(global.quiet);
-        try std.testing.expectEqualStrings("wlan1", sub.interface);
-        try std.testing.expectEqual(@as(u16, 1234), sub.port);
-    }
-}
-
-test "parseMerged returns positional after subcmd" {
-    const Global = struct { verbose: bool = false };
-    const Sub = struct { name: []const u8 = "x" };
-
-    var global = Global{};
-    var sub = Sub{};
-    const rest = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "--name", "foo", "pos1", "pos2" });
-
-    try std.testing.expectEqualStrings("foo", sub.name);
-    try std.testing.expectEqual(@as(usize, 2), rest.len);
-    try std.testing.expectEqualStrings("pos1", rest[0]);
+    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "service", "--", "restart" }));
 }
 
 test "repeatable option appends" {
@@ -1366,56 +1724,5 @@ test "combined short flags GNU-style" {
         _ = try parse(Opts, &opts, &.{"-v"});
         try std.testing.expect(opts.verbose);
         try std.testing.expect(!opts.debug);
-    }
-}
-
-test "combined short flags with parseMerged" {
-    const Global = struct {
-        verbose: bool = false,
-        quiet: bool = false,
-
-        pub const meta = .{
-            .verbose = .{ .short = 'v' },
-            .quiet = .{ .short = 'q' },
-        };
-    };
-
-    const Sub = struct {
-        force: bool = false,
-        interface: []const u8 = "wlan0",
-
-        pub const meta = .{
-            .force = .{ .short = 'f' },
-            .interface = .{ .short = 'i' },
-        };
-    };
-
-    // Combined flags across global and sub: -vf
-    {
-        var global = Global{};
-        var sub = Sub{};
-        _ = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "-vf" });
-        try std.testing.expect(global.verbose);
-        try std.testing.expect(sub.force);
-    }
-
-    // Combined flags with trailing value option: -vfi eth0
-    {
-        var global = Global{};
-        var sub = Sub{};
-        _ = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "-vfi", "eth0" });
-        try std.testing.expect(global.verbose);
-        try std.testing.expect(sub.force);
-        try std.testing.expectEqualStrings("eth0", sub.interface);
-    }
-
-    // Combined with inline value: -vfieth0
-    {
-        var global = Global{};
-        var sub = Sub{};
-        _ = try parseMerged(Global, Sub, &global, &sub, &.{ "cmd", "-vfieth0" });
-        try std.testing.expect(global.verbose);
-        try std.testing.expect(sub.force);
-        try std.testing.expectEqualStrings("eth0", sub.interface);
     }
 }
