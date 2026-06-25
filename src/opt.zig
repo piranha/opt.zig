@@ -38,6 +38,8 @@ pub const ParseError = error{
 
 /// Parse args into opts struct. Returns remaining positional args in positionals_buf.
 pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_buf: [][]const u8) ParseError![]const []const u8 {
+    comptime validateOptionStruct(T);
+
     const fields = @typeInfo(T).@"struct".fields;
     const has_meta = @hasDecl(T, "meta");
 
@@ -666,6 +668,168 @@ fn commandSpecOptions(comptime command_spec: anytype) type {
     return if (commandSpecIsBranch(command_spec)) command_spec.options else command_spec;
 }
 
+fn optionShort(comptime T: type, comptime field: std.builtin.Type.StructField) ?u8 {
+    if (!@hasDecl(T, "meta")) return null;
+    if (!@hasField(@TypeOf(T.meta), field.name)) return null;
+
+    const field_meta = @field(T.meta, field.name);
+    if (!@hasField(@TypeOf(field_meta), "short")) return null;
+    return field_meta.short;
+}
+
+fn validateOptionStruct(comptime T: type) void {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("options must be a struct: " ++ @typeName(T));
+
+    const fields = info.@"struct".fields;
+
+    if (@hasDecl(T, "meta")) {
+        inline for (@typeInfo(@TypeOf(T.meta)).@"struct".fields) |meta_field| {
+            if (!@hasField(T, meta_field.name)) {
+                @compileError("meta entry has no matching option field: " ++ @typeName(T) ++ "." ++ meta_field.name);
+            }
+        }
+    }
+
+    inline for (fields, 0..) |left, left_idx| {
+        if (optionShort(T, left)) |left_short| {
+            inline for (fields[left_idx + 1 ..]) |right| {
+                if (optionShort(T, right)) |right_short| {
+                    if (left_short == right_short) {
+                        @compileError("duplicate short option in " ++ @typeName(T));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validateNoDuplicateOptionsBetween(comptime A: type, comptime B: type) void {
+    const a_fields = @typeInfo(A).@"struct".fields;
+    const b_fields = @typeInfo(B).@"struct".fields;
+
+    inline for (a_fields) |a_field| {
+        inline for (b_fields) |b_field| {
+            if (std.mem.eql(u8, a_field.name, b_field.name)) {
+                @compileError("duplicate long option in visible command path: " ++ @typeName(A) ++ "." ++ a_field.name ++ " and " ++ @typeName(B) ++ "." ++ b_field.name);
+            }
+        }
+
+        if (optionShort(A, a_field)) |a_short| {
+            inline for (b_fields) |b_field| {
+                if (optionShort(B, b_field)) |b_short| {
+                    if (a_short == b_short) {
+                        @compileError("duplicate short option in visible command path between " ++ @typeName(A) ++ " and " ++ @typeName(B));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validateCommandsAgainstScope(comptime commands: anytype, comptime Scope: type) void {
+    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
+        const command_spec = @field(commands, field.name);
+        const Opts = commandSpecOptions(command_spec);
+        validateNoDuplicateOptionsBetween(Scope, Opts);
+        if (comptime commandSpecIsBranch(command_spec)) {
+            validateCommandsAgainstScope(command_spec.commands, Scope);
+        }
+    }
+}
+
+fn validateNoArityConflictBetween(comptime A: type, comptime B: type) void {
+    const a_fields = @typeInfo(A).@"struct".fields;
+    const b_fields = @typeInfo(B).@"struct".fields;
+
+    inline for (a_fields) |a_field| {
+        inline for (b_fields) |b_field| {
+            if (std.mem.eql(u8, a_field.name, b_field.name) and fieldArity(a_field) != fieldArity(b_field)) {
+                @compileError("option has conflicting arity in command tree: " ++ @typeName(A) ++ "." ++ a_field.name ++ " and " ++ @typeName(B) ++ "." ++ b_field.name);
+            }
+        }
+
+        if (optionShort(A, a_field)) |a_short| {
+            inline for (b_fields) |b_field| {
+                if (optionShort(B, b_field)) |b_short| {
+                    if (a_short == b_short and fieldArity(a_field) != fieldArity(b_field)) {
+                        @compileError("short option has conflicting arity in command tree between " ++ @typeName(A) ++ " and " ++ @typeName(B));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validateCommandTreeArityAgainstScope(comptime commands: anytype, comptime Scope: type) void {
+    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
+        const command_spec = @field(commands, field.name);
+        const Opts = commandSpecOptions(command_spec);
+        validateNoArityConflictBetween(Scope, Opts);
+        if (comptime commandSpecIsBranch(command_spec)) {
+            validateCommandTreeArityAgainstScope(command_spec.commands, Scope);
+        }
+    }
+}
+
+fn validateCommandTreeArityBetweenTrees(comptime left_commands: anytype, comptime right_commands: anytype) void {
+    inline for (@typeInfo(@TypeOf(left_commands)).@"struct".fields) |field| {
+        const command_spec = @field(left_commands, field.name);
+        const Opts = commandSpecOptions(command_spec);
+        validateCommandTreeArityAgainstScope(right_commands, Opts);
+        if (comptime commandSpecIsBranch(command_spec)) {
+            validateCommandTreeArityBetweenTrees(command_spec.commands, right_commands);
+        }
+    }
+}
+
+fn validateCommandTreeArityConflicts(comptime commands: anytype) void {
+    const fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
+    inline for (fields, 0..) |left_field, left_idx| {
+        const left_spec = @field(commands, left_field.name);
+        const LeftOpts = commandSpecOptions(left_spec);
+
+        inline for (fields[left_idx + 1 ..]) |right_field| {
+            const right_spec = @field(commands, right_field.name);
+            const RightOpts = commandSpecOptions(right_spec);
+
+            validateNoArityConflictBetween(LeftOpts, RightOpts);
+            if (comptime commandSpecIsBranch(left_spec)) {
+                validateCommandTreeArityAgainstScope(left_spec.commands, RightOpts);
+            }
+            if (comptime commandSpecIsBranch(right_spec)) {
+                validateCommandTreeArityAgainstScope(right_spec.commands, LeftOpts);
+            }
+            if (comptime commandSpecIsBranch(left_spec) and commandSpecIsBranch(right_spec)) {
+                validateCommandTreeArityBetweenTrees(left_spec.commands, right_spec.commands);
+            }
+        }
+
+        if (comptime commandSpecIsBranch(left_spec)) {
+            validateCommandTreeArityConflicts(left_spec.commands);
+        }
+    }
+}
+
+fn validateCommandTree(comptime commands: anytype) void {
+    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
+        const command_spec = @field(commands, field.name);
+        const Opts = commandSpecOptions(command_spec);
+        validateOptionStruct(Opts);
+        if (comptime commandSpecIsBranch(command_spec)) {
+            validateCommandsAgainstScope(command_spec.commands, Opts);
+            validateCommandTree(command_spec.commands);
+        }
+    }
+}
+
+fn validateCommandParserSpec(comptime spec: anytype) void {
+    validateOptionStruct(spec.global);
+    validateCommandsAgainstScope(spec.commands, spec.global);
+    validateCommandTree(spec.commands);
+    validateCommandTreeArityConflicts(spec.commands);
+}
+
 fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?OptionArity {
     var arity: ?OptionArity = null;
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
@@ -1005,6 +1169,10 @@ fn parseSelectedCommand(
 
 pub fn CommandParser(comptime spec: anytype) type {
     return struct {
+        comptime {
+            validateCommandParserSpec(spec);
+        }
+
         const Self = @This();
 
         pub const Global = spec.global;

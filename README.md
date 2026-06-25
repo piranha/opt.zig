@@ -122,6 +122,8 @@ pub const meta = .{
 };
 ```
 
+`meta` entries must correspond to real fields, and duplicate short options in the same option struct are compile errors. For `CommandParser`, duplicate option names/shorts on the same visible command path are compile errors; sibling commands may reuse a spelling only when it has the same value arity.
+
 Optional `about` decl for program info:
 
 ```zig
