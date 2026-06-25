@@ -23,6 +23,7 @@
 //!   };
 
 const std = @import("std");
+const scanner = @import("scanner.zig");
 
 pub const ParseError = error{
     MissingValue,
@@ -44,9 +45,9 @@ pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_b
     const has_meta = @hasDecl(T, "meta");
 
     var pos_idx: usize = 0;
-    var scanner = ArgScanner.init(args, 0);
+    var arg_scanner = scanner.ArgScanner.init(args, 0);
     const resolver = OptionStructResolver(T){};
-    while (scanner.next(resolver)) |token| {
+    while (arg_scanner.next(resolver)) |token| {
         switch (token) {
             .help => return ParseError.Help,
             .end_options => {},
@@ -78,158 +79,7 @@ fn appendPositional(positionals_buf: [][]const u8, pos_idx: *usize, arg: []const
     pos_idx.* += 1;
 }
 
-const OptionKey = union(enum) {
-    long: []const u8,
-    short: u8,
-};
-
-const OptionToken = struct {
-    index: usize,
-    key: OptionKey,
-    negated: bool = false,
-    value: ?[]const u8 = null,
-};
-
-const ArgToken = union(enum) {
-    help,
-    end_options,
-    positional: struct {
-        index: usize,
-        value: []const u8,
-    },
-    option: OptionToken,
-};
-
-/// Owns argv tokenization: dash syntax, short bundles, --, help, and value consumption.
-/// Callers supply arity lookup so the scanner can stay syntax-focused while parsers
-/// decide what each emitted token means.
-const ArgScanner = struct {
-    args: []const []const u8,
-    i: usize = 0,
-    short_i: usize = 0,
-    stop_options: bool = false,
-    name_buf: [64]u8 = undefined,
-
-    fn init(args: []const []const u8, start_index: usize) ArgScanner {
-        return .{ .args = args, .i = start_index };
-    }
-
-    fn takeNextValue(self: *ArgScanner) ?[]const u8 {
-        if (self.i + 1 >= self.args.len) return null;
-        const next_arg = self.args[self.i + 1];
-        if (next_arg.len > 0 and next_arg[0] == '-') return null;
-        self.i += 1;
-        return next_arg;
-    }
-
-    fn next(self: *ArgScanner, resolver: anytype) ?ArgToken {
-        while (self.i < self.args.len) {
-            const arg = self.args[self.i];
-
-            if (self.short_i != 0) {
-                const current_index = self.i;
-                const short = arg[self.short_i];
-                const arity = resolver.shortArity(short);
-
-                if (arity == .flag) {
-                    self.short_i += 1;
-                    if (self.short_i >= arg.len) {
-                        self.short_i = 0;
-                        self.i += 1;
-                    }
-                    return .{ .option = .{ .index = current_index, .key = .{ .short = short } } };
-                }
-
-                var value: ?[]const u8 = null;
-                if (arity == .value) {
-                    if (self.short_i + 1 < arg.len) {
-                        value = arg[self.short_i + 1 ..];
-                    } else {
-                        value = self.takeNextValue();
-                    }
-                }
-
-                self.short_i = 0;
-                self.i += 1;
-                return .{ .option = .{ .index = current_index, .key = .{ .short = short }, .value = value } };
-            }
-
-            if (arg.len == 0) {
-                self.i += 1;
-                continue;
-            }
-
-            const current_index = self.i;
-
-            if (self.stop_options) {
-                self.i += 1;
-                return .{ .positional = .{ .index = current_index, .value = arg } };
-            }
-
-            if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-                self.i += 1;
-                return .help;
-            }
-
-            if (std.mem.eql(u8, arg, "--")) {
-                self.stop_options = true;
-                self.i += 1;
-                return .end_options;
-            }
-
-            if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') {
-                const rest = arg[2..];
-                var name: []const u8 = rest;
-                var value: ?[]const u8 = null;
-                var negated = false;
-                var has_inline_value = false;
-
-                if (rest.len > 3 and std.mem.startsWith(u8, rest, "no-")) {
-                    negated = true;
-                    name = rest[3..];
-                }
-
-                if (std.mem.indexOf(u8, name, "=")) |eq| {
-                    value = name[eq + 1 ..];
-                    name = name[0..eq];
-                    has_inline_value = true;
-                }
-
-                const norm_name = normalizeName(name, &self.name_buf);
-                if (!negated and !has_inline_value and resolver.longArity(norm_name) == .value) {
-                    value = self.takeNextValue();
-                }
-
-                self.i += 1;
-                return .{ .option = .{ .index = current_index, .key = .{ .long = norm_name }, .negated = negated, .value = value } };
-            }
-
-            if (arg.len >= 2 and arg[0] == '-' and arg[1] != '-') {
-                self.short_i = 1;
-                continue;
-            }
-
-            self.i += 1;
-            return .{ .positional = .{ .index = current_index, .value = arg } };
-        }
-
-        return null;
-    }
-};
-
-fn normalizeName(name: []const u8, buf: []u8) []const u8 {
-    var j: usize = 0;
-    for (name) |c| {
-        if (j >= buf.len) break;
-        buf[j] = if (c == '-') '_' else c;
-        j += 1;
-    }
-    return buf[0..j];
-}
-
-const OptionArity = enum { flag, value };
-
-fn fieldArity(comptime field: std.builtin.Type.StructField) OptionArity {
+fn fieldArity(comptime field: std.builtin.Type.StructField) scanner.OptionArity {
     if (field.type == bool) return .flag;
     if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return .flag;
     return .value;
@@ -240,7 +90,7 @@ fn longOptionArity(
     comptime fields: []const std.builtin.Type.StructField,
     comptime has_meta: bool,
     name: []const u8,
-) ?OptionArity {
+) ?scanner.OptionArity {
     _ = T;
     _ = has_meta;
     inline for (fields) |field| {
@@ -254,7 +104,7 @@ fn shortOptionArity(
     comptime fields: []const std.builtin.Type.StructField,
     comptime has_meta: bool,
     short: u8,
-) ?OptionArity {
+) ?scanner.OptionArity {
     if (!has_meta) return null;
 
     inline for (fields) |field| {
@@ -268,7 +118,7 @@ fn shortOptionArity(
     return null;
 }
 
-fn combineArity(a: ?OptionArity, b: ?OptionArity) ?OptionArity {
+fn combineArity(a: ?scanner.OptionArity, b: ?scanner.OptionArity) ?scanner.OptionArity {
     if (a == .value or b == .value) return .value;
     if (a != null or b != null) return .flag;
     return null;
@@ -279,11 +129,11 @@ fn OptionStructResolver(comptime T: type) type {
         const fields = @typeInfo(T).@"struct".fields;
         const has_meta = @hasDecl(T, "meta");
 
-        fn longArity(_: @This(), name: []const u8) ?OptionArity {
+        pub fn longArity(_: @This(), name: []const u8) ?scanner.OptionArity {
             return longOptionArity(T, fields, has_meta, name);
         }
 
-        fn shortArity(_: @This(), short: u8) ?OptionArity {
+        pub fn shortArity(_: @This(), short: u8) ?scanner.OptionArity {
             return shortOptionArity(T, fields, has_meta, short);
         }
     };
@@ -778,8 +628,8 @@ fn validateCommandParserSpec(comptime spec: anytype) void {
     validateCommandTreeArityConflicts(spec.commands);
 }
 
-fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?OptionArity {
-    var arity: ?OptionArity = null;
+fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?scanner.OptionArity {
+    var arity: ?scanner.OptionArity = null;
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
         const Opts = commandSpecOptions(command_spec);
@@ -795,8 +645,8 @@ fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?OptionA
     return arity;
 }
 
-fn shortArityInCommandTree(comptime commands: anytype, short: u8) ?OptionArity {
-    var arity: ?OptionArity = null;
+fn shortArityInCommandTree(comptime commands: anytype, short: u8) ?scanner.OptionArity {
+    var arity: ?scanner.OptionArity = null;
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
         const Opts = commandSpecOptions(command_spec);
@@ -812,7 +662,7 @@ fn shortArityInCommandTree(comptime commands: anytype, short: u8) ?OptionArity {
     return arity;
 }
 
-fn longArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), name: []const u8) ?OptionArity {
+fn longArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), name: []const u8) ?scanner.OptionArity {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
@@ -828,7 +678,7 @@ fn longArityInSelectedCommand(comptime commands: anytype, command: *const comman
     }
 }
 
-fn shortArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), short: u8) ?OptionArity {
+fn shortArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), short: u8) ?scanner.OptionArity {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
@@ -851,14 +701,14 @@ fn CommandDiscoveryResolver(comptime G: type, comptime Scope: type, comptime com
         const scope_fields = if (Scope != void) @typeInfo(Scope).@"struct".fields else &[_]std.builtin.Type.StructField{};
         const scope_has_meta = if (Scope != void) @hasDecl(Scope, "meta") else false;
 
-        fn longArity(_: @This(), name: []const u8) ?OptionArity {
+        pub fn longArity(_: @This(), name: []const u8) ?scanner.OptionArity {
             return combineArity(
                 combineArity(longOptionArity(G, g_fields, g_has_meta, name), if (Scope != void) longOptionArity(Scope, scope_fields, scope_has_meta, name) else null),
                 longArityInCommandTree(commands, name),
             );
         }
 
-        fn shortArity(_: @This(), short: u8) ?OptionArity {
+        pub fn shortArity(_: @This(), short: u8) ?scanner.OptionArity {
             return combineArity(
                 combineArity(shortOptionArity(G, g_fields, g_has_meta, short), if (Scope != void) shortOptionArity(Scope, scope_fields, scope_has_meta, short) else null),
                 shortArityInCommandTree(commands, short),
@@ -874,11 +724,11 @@ fn SelectedCommandResolver(comptime G: type, comptime commands: anytype) type {
         const g_fields = @typeInfo(G).@"struct".fields;
         const g_has_meta = @hasDecl(G, "meta");
 
-        fn longArity(self: @This(), name: []const u8) ?OptionArity {
+        pub fn longArity(self: @This(), name: []const u8) ?scanner.OptionArity {
             return combineArity(longOptionArity(G, g_fields, g_has_meta, name), longArityInSelectedCommand(commands, self.command, name));
         }
 
-        fn shortArity(self: @This(), short: u8) ?OptionArity {
+        pub fn shortArity(self: @This(), short: u8) ?scanner.OptionArity {
             return combineArity(shortOptionArity(G, g_fields, g_has_meta, short), shortArityInSelectedCommand(commands, self.command, short));
         }
     };
@@ -961,9 +811,9 @@ fn discoverCommand(
 ) ParseError!commandFound(commands) {
     const command_fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
 
-    var scanner = ArgScanner.init(args, start_index);
+    var arg_scanner = scanner.ArgScanner.init(args, start_index);
     const resolver = CommandDiscoveryResolver(G, Scope, commands){};
-    while (scanner.next(resolver)) |token| {
+    while (arg_scanner.next(resolver)) |token| {
         switch (token) {
             .help => return ParseError.Help,
             .end_options => return ParseError.MissingCommand,
@@ -1015,9 +865,9 @@ fn parseSelectedCommand(
     const g_has_meta = @hasDecl(G, "meta");
 
     var pos_idx: usize = 0;
-    var scanner = ArgScanner.init(args, 0);
+    var arg_scanner = scanner.ArgScanner.init(args, 0);
     const resolver = SelectedCommandResolver(G, commands){ .command = command };
-    while (scanner.next(resolver)) |token| {
+    while (arg_scanner.next(resolver)) |token| {
         switch (token) {
             .help => return ParseError.Help,
             .end_options => {},
