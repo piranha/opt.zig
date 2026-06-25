@@ -49,19 +49,14 @@ pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_b
             .end_options => {},
             .positional => |pos| try appendPositional(positionals_buf, &pos_idx, pos.value),
             .option => |opt| {
-                const result = switch (opt.key) {
+                const found = try switch (opt.key) {
                     .long => |name| if (opt.negated)
                         options.setFieldNegated(T, fields, has_meta, opts, name)
                     else
                         options.setField(T, fields, has_meta, opts, name, opt.value),
                     .short => |short| options.setFieldByShort(T, fields, has_meta, opts, short, opt.value),
                 };
-                switch (result) {
-                    .ok => {},
-                    .missing_value => return errors.ParseError.MissingValue,
-                    .invalid_value => return errors.ParseError.InvalidValue,
-                    .not_found => return errors.ParseError.UnknownOption,
-                }
+                if (!found) return errors.ParseError.UnknownOption;
             },
         }
     }
@@ -424,25 +419,22 @@ fn setLongInSelectedCommand(
     name: []const u8,
     is_negated: bool,
     value: ?[]const u8,
-) options.FieldResult {
+) errors.ParseError!bool {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
             const Opts = commandSpecOptions(command_spec);
             const fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            const result = if (is_negated)
+            const found = try if (is_negated)
                 options.setFieldNegated(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name)
             else
                 options.setField(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name, value);
-            switch (result) {
-                .ok, .missing_value, .invalid_value => return result,
-                .not_found => {},
-            }
+            if (found) return true;
             if (comptime commandSpecIsBranch(command_spec)) {
                 return setLongInSelectedCommand(command_spec.commands, &payload.command, name, is_negated, value);
             }
-            return .not_found;
+            return false;
         },
     }
 }
@@ -452,22 +444,19 @@ fn setShortInSelectedCommand(
     command: *commandUnion(commands),
     short: u8,
     value: ?[]const u8,
-) options.FieldResult {
+) errors.ParseError!bool {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
             const Opts = commandSpecOptions(command_spec);
             const fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            const result = options.setFieldByShort(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, short, value);
-            switch (result) {
-                .ok, .missing_value, .invalid_value => return result,
-                .not_found => {},
-            }
+            const found = try options.setFieldByShort(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, short, value);
+            if (found) return true;
             if (comptime commandSpecIsBranch(command_spec)) {
                 return setShortInSelectedCommand(command_spec.commands, &payload.command, short, value);
             }
-            return .not_found;
+            return false;
         },
     }
 }
@@ -546,30 +535,20 @@ fn parseSelectedCommand(
                 try appendPositional(positionals_buf, &pos_idx, pos.value);
             },
             .option => |opt| {
-                const g_result = switch (opt.key) {
+                const global_found = try switch (opt.key) {
                     .long => |name| if (opt.negated)
                         options.setFieldNegated(G, g_fields, g_has_meta, global, name)
                     else
                         options.setField(G, g_fields, g_has_meta, global, name, opt.value),
                     .short => |short| options.setFieldByShort(G, g_fields, g_has_meta, global, short, opt.value),
                 };
-                switch (g_result) {
-                    .ok => continue,
-                    .missing_value => return errors.ParseError.MissingValue,
-                    .invalid_value => return errors.ParseError.InvalidValue,
-                    .not_found => {},
-                }
+                if (global_found) continue;
 
-                const c_result = switch (opt.key) {
+                const command_found = try switch (opt.key) {
                     .long => |name| setLongInSelectedCommand(commands, command, name, opt.negated, opt.value),
                     .short => |short| setShortInSelectedCommand(commands, command, short, opt.value),
                 };
-                switch (c_result) {
-                    .ok => {},
-                    .missing_value => return errors.ParseError.MissingValue,
-                    .invalid_value => return errors.ParseError.InvalidValue,
-                    .not_found => return errors.ParseError.UnknownOption,
-                }
+                if (!command_found) return errors.ParseError.UnknownOption;
             },
         }
     }
@@ -945,6 +924,15 @@ test "repeatable option appends" {
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualStrings("log", got[0]);
     try std.testing.expectEqualStrings("pyc", got[1]);
+}
+
+test "repeatable option overflow reports TooManyValues" {
+    const Opts = struct {
+        exclude: Multi([]const u8, 1) = .{},
+    };
+
+    var opts = Opts{};
+    try std.testing.expectError(errors.ParseError.TooManyValues, parseNoPositionals(Opts, &opts, &.{ "--exclude", "log", "--exclude", "pyc" }));
 }
 
 test "trailing options after positionals" {

@@ -63,8 +63,6 @@ pub fn OptionStructResolver(comptime T: type) type {
     };
 }
 
-pub const FieldResult = enum { not_found, ok, missing_value, invalid_value };
-
 pub fn setField(
     comptime T: type,
     comptime fields: []const std.builtin.Type.StructField,
@@ -72,17 +70,14 @@ pub fn setField(
     opts: *T,
     name: []const u8,
     value: ?[]const u8,
-) FieldResult {
+) errors.ParseError!bool {
     inline for (fields) |field| {
         if (std.mem.eql(u8, field.name, name)) {
-            setValue(T, opts, field, has_meta, value) catch |e| return switch (e) {
-                error.MissingValue => .missing_value,
-                else => .invalid_value,
-            };
-            return .ok;
+            try setValue(T, opts, field, has_meta, value);
+            return true;
         }
     }
-    return .not_found;
+    return false;
 }
 
 pub fn setFieldNegated(
@@ -91,14 +86,14 @@ pub fn setFieldNegated(
     comptime has_meta: bool,
     opts: *T,
     name: []const u8,
-) FieldResult {
+) errors.ParseError!bool {
     inline for (fields) |field| {
         if (std.mem.eql(u8, field.name, name)) {
-            setNegatedValue(T, opts, field, has_meta) catch return .invalid_value;
-            return .ok;
+            try setNegatedValue(T, opts, field, has_meta);
+            return true;
         }
     }
-    return .not_found;
+    return false;
 }
 
 fn setNegatedValue(
@@ -141,24 +136,21 @@ pub fn setFieldByShort(
     opts: *T,
     short: u8,
     value: ?[]const u8,
-) FieldResult {
-    if (!has_meta) return .not_found;
+) errors.ParseError!bool {
+    if (!has_meta) return false;
 
     inline for (fields) |field| {
         if (@hasField(@TypeOf(T.meta), field.name)) {
             const field_meta = @field(T.meta, field.name);
             if (@hasField(@TypeOf(field_meta), "short")) {
                 if (field_meta.short == short) {
-                    setValue(T, opts, field, has_meta, value) catch |e| return switch (e) {
-                        error.MissingValue => .missing_value,
-                        else => .invalid_value,
-                    };
-                    return .ok;
+                    try setValue(T, opts, field, has_meta, value);
+                    return true;
                 }
             }
         }
     }
-    return .not_found;
+    return false;
 }
 
 fn setValue(
