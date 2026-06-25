@@ -25,7 +25,8 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var opts = Options{};
-    const positionals = opt.parse(Options, &opts, args[1..]) catch |e| {
+    var positionals_buf: [256][]const u8 = undefined;
+    const positionals = opt.parse(Options, &opts, args[1..], &positionals_buf) catch |e| {
         if (e == error.Help) opt.printUsage(Options, stdout);
         return e;
     };
@@ -71,9 +72,9 @@ exe.root_module.addImport("opt", opt.module("opt"));
 
 ## API
 
-### `parse(T, *T, args) ![][]const u8`
+### `parse(T, *T, args, positionals_buf) ![][]const u8`
 
-Parse args into struct. Returns positional arguments.
+Parse args into struct. Returns positional arguments stored in the caller-owned `positionals_buf`.
 
 ### `CommandParser(spec) type`
 
@@ -95,10 +96,11 @@ const Cli = opt.CommandParser(.{
     },
 });
 
-const parsed = try Cli.parse(args);
+var positionals_buf: [256][]const u8 = undefined;
+const parsed = try Cli.parse(args, &positionals_buf);
 ```
 
-The result contains `global`, `command`, `command_name`, `command_index`, and `positionals`.
+The result contains `global`, `command`, `command_name`, `command_index`, and `positionals`. The `positionals` slice uses the caller-owned buffer.
 
 ### `printUsage(T, writer) void`
 
@@ -249,7 +251,8 @@ const Cli = opt.CommandParser(.{
     },
 });
 
-const parsed = try Cli.parse(args);
+var positionals_buf: [256][]const u8 = undefined;
+const parsed = try Cli.parse(args, &positionals_buf);
 switch (parsed.command) {
     .build => |build| try runBuild(parsed.global, build, parsed.positionals),
     .service => |service| switch (service.command) {

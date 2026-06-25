@@ -16,7 +16,8 @@
 //!   };
 //!
 //!   var opts = Options{};
-//!   const positionals = opt.parse(Options, &opts, args) catch |e| {
+//!   var positionals_buf: [256][]const u8 = undefined;
+//!   const positionals = opt.parse(Options, &opts, args, &positionals_buf) catch |e| {
 //!       if (e == error.Help) opt.printUsage(Options, stdout);
 //!       return e;
 //!   };
@@ -32,10 +33,11 @@ pub const ParseError = error{
     Help,
     OutOfMemory,
     TooManyValues,
+    TooManyPositionals,
 };
 
-/// Parse args into opts struct. Returns remaining positional args.
-pub fn parse(comptime T: type, opts: *T, args: []const []const u8) ParseError![]const []const u8 {
+/// Parse args into opts struct. Returns remaining positional args in positionals_buf.
+pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_buf: [][]const u8) ParseError![]const []const u8 {
     const fields = @typeInfo(T).@"struct".fields;
     const has_meta = @hasDecl(T, "meta");
 
@@ -112,11 +114,7 @@ pub fn parse(comptime T: type, opts: *T, args: []const []const u8) ParseError![]
         }
     }
 
-    // Second pass: collect positionals into buffer using thread-local storage.
-    const S = struct {
-        threadlocal var positional_buf: [256][]const u8 = undefined;
-    };
-
+    // Second pass: collect positionals into the caller-owned buffer.
     var pos_idx: usize = 0;
     i = 0;
     stop_parsing_options = false;
@@ -125,10 +123,7 @@ pub fn parse(comptime T: type, opts: *T, args: []const []const u8) ParseError![]
         if (arg.len == 0) continue;
 
         if (stop_parsing_options) {
-            if (pos_idx < 256) {
-                S.positional_buf[pos_idx] = arg;
-                pos_idx += 1;
-            }
+            try appendPositional(positionals_buf, &pos_idx, arg);
             continue;
         }
 
@@ -177,13 +172,16 @@ pub fn parse(comptime T: type, opts: *T, args: []const []const u8) ParseError![]
             continue;
         }
 
-        if (pos_idx < 256) {
-            S.positional_buf[pos_idx] = arg;
-            pos_idx += 1;
-        }
+        try appendPositional(positionals_buf, &pos_idx, arg);
     }
 
-    return S.positional_buf[0..pos_idx];
+    return positionals_buf[0..pos_idx];
+}
+
+fn appendPositional(positionals_buf: [][]const u8, pos_idx: *usize, arg: []const u8) ParseError!void {
+    if (pos_idx.* >= positionals_buf.len) return ParseError.TooManyPositionals;
+    positionals_buf[pos_idx.*] = arg;
+    pos_idx.* += 1;
 }
 
 fn normalizeName(name: []const u8, buf: []u8) []const u8 {
@@ -897,13 +895,10 @@ fn parseSelectedCommand(
     command: *commandUnion(commands),
     root_command_index: usize,
     args: []const []const u8,
+    positionals_buf: [][]const u8,
 ) ParseError![]const []const u8 {
     const g_fields = @typeInfo(G).@"struct".fields;
     const g_has_meta = @hasDecl(G, "meta");
-
-    const S = struct {
-        threadlocal var positional_buf: [256][]const u8 = undefined;
-    };
 
     var pos_idx: usize = 0;
     var i: usize = 0;
@@ -915,10 +910,7 @@ fn parseSelectedCommand(
         if (selectedCommandIndex(commands, command, root_command_index, i)) continue;
 
         if (stop_parsing_options) {
-            if (pos_idx < 256) {
-                S.positional_buf[pos_idx] = arg;
-                pos_idx += 1;
-            }
+            try appendPositional(positionals_buf, &pos_idx, arg);
             continue;
         }
 
@@ -1005,13 +997,10 @@ fn parseSelectedCommand(
             continue;
         }
 
-        if (pos_idx < 256) {
-            S.positional_buf[pos_idx] = arg;
-            pos_idx += 1;
-        }
+        try appendPositional(positionals_buf, &pos_idx, arg);
     }
 
-    return S.positional_buf[0..pos_idx];
+    return positionals_buf[0..pos_idx];
 }
 
 pub fn CommandParser(comptime spec: anytype) type {
@@ -1029,10 +1018,10 @@ pub fn CommandParser(comptime spec: anytype) type {
             positionals: []const []const u8,
         };
 
-        pub fn parse(args: []const []const u8) ParseError!Result {
+        pub fn parse(args: []const []const u8, positionals_buf: [][]const u8) ParseError!Result {
             var global = Global{};
             var found = try discoverCommand(Global, void, spec.commands, args, 0);
-            const positionals = try parseSelectedCommand(Global, spec.commands, &global, &found.command, found.command_index, args);
+            const positionals = try parseSelectedCommand(Global, spec.commands, &global, &found.command, found.command_index, args, positionals_buf);
             return .{
                 .global = global,
                 .command = found.command,
@@ -1125,6 +1114,11 @@ fn printFields(comptime T: type, writer: anytype) void {
 
 // ============ Tests ============
 
+fn parseNoPositionals(comptime T: type, opts: *T, args: []const []const u8) ParseError!void {
+    var positionals: [0][]const u8 = .{};
+    _ = try parse(T, opts, args, &positionals);
+}
+
 test "parse basic options" {
     const Opts = struct {
         name: []const u8 = "default",
@@ -1139,7 +1133,7 @@ test "parse basic options" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "-n", "foo", "-c", "42", "-v" });
+    try parseNoPositionals(Opts, &opts, &.{ "-n", "foo", "-c", "42", "-v" });
 
     try std.testing.expectEqualStrings("foo", opts.name);
     try std.testing.expectEqual(@as(u32, 42), opts.count);
@@ -1153,7 +1147,7 @@ test "parse long options" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "--input-port", "1234", "--output-addr=192.168.1.1" });
+    try parseNoPositionals(Opts, &opts, &.{ "--input-port", "1234", "--output-addr=192.168.1.1" });
 
     try std.testing.expectEqual(@as(u16, 1234), opts.input_port);
     try std.testing.expectEqualStrings("192.168.1.1", opts.output_addr);
@@ -1167,11 +1161,33 @@ test "parse returns positional args" {
     };
 
     var opts = Opts{};
-    const rest = try parse(Opts, &opts, &.{ "-v", "file1", "file2" });
+    var positionals: [256][]const u8 = undefined;
+    const rest = try parse(Opts, &opts, &.{ "-v", "file1", "file2" }, &positionals);
 
     try std.testing.expect(opts.verbose);
     try std.testing.expectEqual(@as(usize, 2), rest.len);
     try std.testing.expectEqualStrings("file1", rest[0]);
+}
+
+test "positionals use caller-owned storage" {
+    const Opts = struct {
+        verbose: bool = false,
+    };
+
+    var first_opts = Opts{};
+    var first_buf: [2][]const u8 = undefined;
+    const first = try parse(Opts, &first_opts, &.{ "one", "two" }, &first_buf);
+
+    var second_opts = Opts{};
+    var second_buf: [1][]const u8 = undefined;
+    _ = try parse(Opts, &second_opts, &.{"other"}, &second_buf);
+
+    try std.testing.expectEqualStrings("one", first[0]);
+    try std.testing.expectEqualStrings("two", first[1]);
+
+    var too_small_opts = Opts{};
+    var too_small: [1][]const u8 = undefined;
+    try std.testing.expectError(ParseError.TooManyPositionals, parse(Opts, &too_small_opts, &.{ "one", "two" }, &too_small));
 }
 
 test "help flag returns error" {
@@ -1180,7 +1196,7 @@ test "help flag returns error" {
     };
 
     var opts = Opts{};
-    const result = parse(Opts, &opts, &.{"--help"});
+    const result = parseNoPositionals(Opts, &opts, &.{"--help"});
     try std.testing.expectError(ParseError.Help, result);
 }
 
@@ -1216,7 +1232,7 @@ test "optional field" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "--config", "foo.toml", "--limit", "100" });
+    try parseNoPositionals(Opts, &opts, &.{ "--config", "foo.toml", "--limit", "100" });
 
     try std.testing.expectEqualStrings("foo.toml", opts.config.?);
     try std.testing.expectEqual(@as(u32, 100), opts.limit.?);
@@ -1229,7 +1245,7 @@ test "enum field" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "--mode", "fast" });
+    try parseNoPositionals(Opts, &opts, &.{ "--mode", "fast" });
 
     try std.testing.expectEqual(Mode.fast, opts.mode);
 }
@@ -1260,7 +1276,8 @@ test "CommandParser finds command after valued global option" {
         },
     });
 
-    const parsed = try Cli.parse(&.{ "--service", "cam", "restart", "--force", "pos" });
+    var positionals: [256][]const u8 = undefined;
+    const parsed = try Cli.parse(&.{ "--service", "cam", "restart", "--force", "pos" }, &positionals);
     try std.testing.expectEqualStrings("cam", parsed.global.service);
     try std.testing.expectEqualStrings("restart", parsed.command_name);
     try std.testing.expectEqual(@as(usize, 2), parsed.command_index);
@@ -1271,18 +1288,18 @@ test "CommandParser finds command after valued global option" {
     try std.testing.expectEqual(@as(usize, 1), parsed.positionals.len);
     try std.testing.expectEqualStrings("pos", parsed.positionals[0]);
 
-    const combined = try Cli.parse(&.{ "restart", "-vf" });
+    const combined = try Cli.parse(&.{ "restart", "-vf" }, &positionals);
     try std.testing.expect(combined.global.verbose);
     try std.testing.expect(combined.command.restart.force);
 
-    const stopped = try Cli.parse(&.{ "restart", "--", "--force", "pos" });
+    const stopped = try Cli.parse(&.{ "restart", "--", "--force", "pos" }, &positionals);
     try std.testing.expect(!stopped.command.restart.force);
     try std.testing.expectEqual(@as(usize, 2), stopped.positionals.len);
     try std.testing.expectEqualStrings("--force", stopped.positionals[0]);
     try std.testing.expectEqualStrings("pos", stopped.positionals[1]);
 
-    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "--", "restart" }));
-    try std.testing.expectError(ParseError.Help, Cli.parse(&.{"--help"}));
+    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "--", "restart" }, &positionals));
+    try std.testing.expectError(ParseError.Help, Cli.parse(&.{"--help"}, &positionals));
 }
 
 test "CommandParser supports nested command groups" {
@@ -1314,7 +1331,8 @@ test "CommandParser supports nested command groups" {
         },
     });
 
-    const parsed = try Cli.parse(&.{ "--verbose", "service", "--name", "cam", "restart", "--force", "pos1" });
+    var positionals: [256][]const u8 = undefined;
+    const parsed = try Cli.parse(&.{ "--verbose", "service", "--name", "cam", "restart", "--force", "pos1" }, &positionals);
     try std.testing.expect(parsed.global.verbose);
     try std.testing.expectEqualStrings("service", parsed.command_name);
     try std.testing.expectEqual(@as(usize, 1), parsed.command_index);
@@ -1332,7 +1350,7 @@ test "CommandParser supports nested command groups" {
     try std.testing.expectEqual(@as(usize, 1), parsed.positionals.len);
     try std.testing.expectEqualStrings("pos1", parsed.positionals[0]);
 
-    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "service", "--", "restart" }));
+    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "service", "--", "restart" }, &positionals));
 }
 
 test "repeatable option appends" {
@@ -1343,7 +1361,7 @@ test "repeatable option appends" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "-x", "log", "-x", "pyc" });
+    try parseNoPositionals(Opts, &opts, &.{ "-x", "log", "-x", "pyc" });
 
     const got = opts.exclude.constSlice();
     try std.testing.expectEqual(@as(usize, 2), got.len);
@@ -1358,8 +1376,9 @@ test "trailing options after positionals" {
     };
 
     var opts = Opts{};
+    var positionals: [256][]const u8 = undefined;
     // ship --sudo zig-out/bin/wizig:/usr/bin/wizig ygs --restart 'sudo systemctl restart wizig'
-    const rest = try parse(Opts, &opts, &.{ "--sudo", "src:dst", "ygs", "--restart", "cmd" });
+    const rest = try parse(Opts, &opts, &.{ "--sudo", "src:dst", "ygs", "--restart", "cmd" }, &positionals);
 
     try std.testing.expect(opts.sudo);
     try std.testing.expectEqualStrings("cmd", opts.restart); // parsed even after positional
@@ -1375,7 +1394,8 @@ test "double dash stops option parsing" {
     };
 
     var opts = Opts{};
-    const rest = try parse(Opts, &opts, &.{ "-v", "--", "-not-an-option", "file" });
+    var positionals: [256][]const u8 = undefined;
+    const rest = try parse(Opts, &opts, &.{ "-v", "--", "-not-an-option", "file" }, &positionals);
 
     try std.testing.expect(opts.verbose);
     try std.testing.expectEqual(@as(usize, 2), rest.len);
@@ -1390,7 +1410,7 @@ test "negated bool with --no-*" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "--no-verbose", "--debug" });
+    try parseNoPositionals(Opts, &opts, &.{ "--no-verbose", "--debug" });
 
     try std.testing.expect(!opts.verbose);
     try std.testing.expect(opts.debug);
@@ -1403,7 +1423,7 @@ test "negated optional with --no-*" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{ "--no-config", "--no-limit" });
+    try parseNoPositionals(Opts, &opts, &.{ "--no-config", "--no-limit" });
 
     try std.testing.expectEqual(@as(?[]const u8, null), opts.config);
     try std.testing.expectEqual(@as(?u32, null), opts.limit);
@@ -1420,7 +1440,7 @@ test "negated with no_value in meta" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{"--no-compress"});
+    try parseNoPositionals(Opts, &opts, &.{"--no-compress"});
 
     try std.testing.expectEqual(Compress.off, opts.compress);
 }
@@ -1438,14 +1458,14 @@ test "flag_value for value-optional flags" {
     // --compress alone uses flag_value
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"--compress"});
+        try parseNoPositionals(Opts, &opts, &.{"--compress"});
         try std.testing.expectEqual(Compress.on, opts.compress);
     }
 
     // --compress=auto still parses the value
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"--compress=off"});
+        try parseNoPositionals(Opts, &opts, &.{"--compress=off"});
         try std.testing.expectEqual(Compress.off, opts.compress);
     }
 }
@@ -1463,21 +1483,21 @@ test "flag_value and no_value together" {
     // --compress → .on
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"--compress"});
+        try parseNoPositionals(Opts, &opts, &.{"--compress"});
         try std.testing.expectEqual(Compress.on, opts.compress);
     }
 
     // --no-compress → .off
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"--no-compress"});
+        try parseNoPositionals(Opts, &opts, &.{"--no-compress"});
         try std.testing.expectEqual(Compress.off, opts.compress);
     }
 
     // --compress=auto → .auto
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"--compress=auto"});
+        try parseNoPositionals(Opts, &opts, &.{"--compress=auto"});
         try std.testing.expectEqual(Compress.auto, opts.compress);
     }
 }
@@ -1498,7 +1518,7 @@ test "flag_value followed by other flags" {
     // --compress followed by --verbose (not consumed as value)
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{ "--compress", "--verbose" });
+        try parseNoPositionals(Opts, &opts, &.{ "--compress", "--verbose" });
         try std.testing.expectEqual(Compress.on, opts.compress);
         try std.testing.expect(opts.verbose);
     }
@@ -1506,7 +1526,7 @@ test "flag_value followed by other flags" {
     // --compress followed by -v (not consumed as value)
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{ "--compress", "-v" });
+        try parseNoPositionals(Opts, &opts, &.{ "--compress", "-v" });
         try std.testing.expectEqual(Compress.on, opts.compress);
         try std.testing.expect(opts.verbose);
     }
@@ -1514,14 +1534,14 @@ test "flag_value followed by other flags" {
     // --compress at end of args
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"--compress"});
+        try parseNoPositionals(Opts, &opts, &.{"--compress"});
         try std.testing.expectEqual(Compress.on, opts.compress);
     }
 
     // --level still requires value (no flag_value)
     {
         var opts = Opts{};
-        const result = parse(Opts, &opts, &.{"--level"});
+        const result = parseNoPositionals(Opts, &opts, &.{"--level"});
         try std.testing.expectError(ParseError.MissingValue, result);
     }
 }
@@ -1545,21 +1565,21 @@ test "custom parse function" {
     // Valid octal
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{ "--chmod", "644" });
+        try parseNoPositionals(Opts, &opts, &.{ "--chmod", "644" });
         try std.testing.expectEqual(@as(?u16, 0o644), opts.chmod);
     }
 
     // Another valid octal
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{ "--chmod", "755" });
+        try parseNoPositionals(Opts, &opts, &.{ "--chmod", "755" });
         try std.testing.expectEqual(@as(?u16, 0o755), opts.chmod);
     }
 
     // Invalid octal (has 8 and 9)
     {
         var opts = Opts{};
-        const result = parse(Opts, &opts, &.{ "--chmod", "899" });
+        const result = parseNoPositionals(Opts, &opts, &.{ "--chmod", "899" });
         try std.testing.expectError(ParseError.InvalidValue, result);
     }
 }
@@ -1584,14 +1604,14 @@ test "custom parse function returning error union" {
     // Valid port
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{ "--port", "3000" });
+        try parseNoPositionals(Opts, &opts, &.{ "--port", "3000" });
         try std.testing.expectEqual(@as(u16, 3000), opts.port);
     }
 
     // Invalid (privileged port)
     {
         var opts = Opts{};
-        const result = parse(Opts, &opts, &.{ "--port", "80" });
+        const result = parseNoPositionals(Opts, &opts, &.{ "--port", "80" });
         try std.testing.expectError(ParseError.InvalidValue, result);
     }
 }
@@ -1610,7 +1630,8 @@ test "hyphenated positional not treated as option" {
     // "metabase-enterprise" contains "-e" but shouldn't trigger the -e short option
     {
         var opts = Opts{};
-        const rest = try parse(Opts, &opts, &.{"metabase-enterprise"});
+        var positionals: [256][]const u8 = undefined;
+        const rest = try parse(Opts, &opts, &.{"metabase-enterprise"}, &positionals);
         try std.testing.expectEqualStrings("", opts.exclude); // -e not triggered
         try std.testing.expectEqual(@as(usize, 1), rest.len);
         try std.testing.expectEqualStrings("metabase-enterprise", rest[0]);
@@ -1619,7 +1640,8 @@ test "hyphenated positional not treated as option" {
     // Same with other options present
     {
         var opts = Opts{};
-        const rest = try parse(Opts, &opts, &.{ "-v", "metabase-enterprise" });
+        var positionals: [256][]const u8 = undefined;
+        const rest = try parse(Opts, &opts, &.{ "-v", "metabase-enterprise" }, &positionals);
         try std.testing.expect(opts.verbose);
         try std.testing.expectEqualStrings("", opts.exclude);
         try std.testing.expectEqual(@as(usize, 1), rest.len);
@@ -1629,7 +1651,8 @@ test "hyphenated positional not treated as option" {
     // Actual -e flag still works
     {
         var opts = Opts{};
-        const rest = try parse(Opts, &opts, &.{ "-e", "pattern", "metabase-enterprise" });
+        var positionals: [256][]const u8 = undefined;
+        const rest = try parse(Opts, &opts, &.{ "-e", "pattern", "metabase-enterprise" }, &positionals);
         try std.testing.expectEqualStrings("pattern", opts.exclude);
         try std.testing.expectEqual(@as(usize, 1), rest.len);
         try std.testing.expectEqualStrings("metabase-enterprise", rest[0]);
@@ -1652,7 +1675,7 @@ test "custom parse with --no-* still works" {
     };
 
     var opts = Opts{};
-    _ = try parse(Opts, &opts, &.{"--no-chmod"});
+    try parseNoPositionals(Opts, &opts, &.{"--no-chmod"});
     try std.testing.expectEqual(@as(?u16, null), opts.chmod);
 }
 
@@ -1676,7 +1699,7 @@ test "combined short flags GNU-style" {
     // Combined bool flags: -vdf
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"-vdf"});
+        try parseNoPositionals(Opts, &opts, &.{"-vdf"});
         try std.testing.expect(opts.verbose);
         try std.testing.expect(opts.debug);
         try std.testing.expect(opts.force);
@@ -1685,7 +1708,7 @@ test "combined short flags GNU-style" {
     // Combined bools followed by value option: -vdn hello
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{ "-vdn", "hello" });
+        try parseNoPositionals(Opts, &opts, &.{ "-vdn", "hello" });
         try std.testing.expect(opts.verbose);
         try std.testing.expect(opts.debug);
         try std.testing.expectEqualStrings("hello", opts.name);
@@ -1694,7 +1717,7 @@ test "combined short flags GNU-style" {
     // Combined bools with inline value: -vdnhello
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"-vdnhello"});
+        try parseNoPositionals(Opts, &opts, &.{"-vdnhello"});
         try std.testing.expect(opts.verbose);
         try std.testing.expect(opts.debug);
         try std.testing.expectEqualStrings("hello", opts.name);
@@ -1703,7 +1726,7 @@ test "combined short flags GNU-style" {
     // Value option first consumes rest: -nfoo (name="foo", not -n -f -o -o)
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"-nfoo"});
+        try parseNoPositionals(Opts, &opts, &.{"-nfoo"});
         try std.testing.expect(!opts.force); // -f not triggered
         try std.testing.expectEqualStrings("foo", opts.name);
     }
@@ -1711,7 +1734,8 @@ test "combined short flags GNU-style" {
     // Combined with positionals
     {
         var opts = Opts{};
-        const rest = try parse(Opts, &opts, &.{ "-vf", "file1", "file2" });
+        var positionals: [256][]const u8 = undefined;
+        const rest = try parse(Opts, &opts, &.{ "-vf", "file1", "file2" }, &positionals);
         try std.testing.expect(opts.verbose);
         try std.testing.expect(opts.force);
         try std.testing.expectEqual(@as(usize, 2), rest.len);
@@ -1721,7 +1745,7 @@ test "combined short flags GNU-style" {
     // Single short flag still works
     {
         var opts = Opts{};
-        _ = try parse(Opts, &opts, &.{"-v"});
+        try parseNoPositionals(Opts, &opts, &.{"-v"});
         try std.testing.expect(opts.verbose);
         try std.testing.expect(!opts.debug);
     }
