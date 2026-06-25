@@ -201,79 +201,6 @@ fn validateCommandsAgainstScope(comptime commands: anytype, comptime Scope: type
     }
 }
 
-fn validateNoValueModeConflictBetween(comptime A: type, comptime B: type) void {
-    const a_fields = @typeInfo(A).@"struct".fields;
-    const b_fields = @typeInfo(B).@"struct".fields;
-
-    inline for (a_fields) |a_field| {
-        inline for (b_fields) |b_field| {
-            if (std.mem.eql(u8, a_field.name, b_field.name) and options.fieldValueMode(A, a_field) != options.fieldValueMode(B, b_field)) {
-                @compileError("option has conflicting mode in command tree: " ++ @typeName(A) ++ "." ++ a_field.name ++ " and " ++ @typeName(B) ++ "." ++ b_field.name);
-            }
-        }
-
-        if (options.optionShort(A, a_field)) |a_short| {
-            inline for (b_fields) |b_field| {
-                if (options.optionShort(B, b_field)) |b_short| {
-                    if (a_short == b_short and options.fieldValueMode(A, a_field) != options.fieldValueMode(B, b_field)) {
-                        @compileError("short option has conflicting mode in command tree between " ++ @typeName(A) ++ " and " ++ @typeName(B));
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn validateCommandTreeValueModeAgainstScope(comptime commands: anytype, comptime Scope: type) void {
-    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
-        const command_spec = @field(commands, field.name);
-        const Opts = commandSpecOptions(command_spec);
-        validateNoValueModeConflictBetween(Scope, Opts);
-        if (comptime commandSpecIsBranch(command_spec)) {
-            validateCommandTreeValueModeAgainstScope(command_spec.commands, Scope);
-        }
-    }
-}
-
-fn validateCommandTreeValueModeBetweenTrees(comptime left_commands: anytype, comptime right_commands: anytype) void {
-    inline for (@typeInfo(@TypeOf(left_commands)).@"struct".fields) |field| {
-        const command_spec = @field(left_commands, field.name);
-        const Opts = commandSpecOptions(command_spec);
-        validateCommandTreeValueModeAgainstScope(right_commands, Opts);
-        if (comptime commandSpecIsBranch(command_spec)) {
-            validateCommandTreeValueModeBetweenTrees(command_spec.commands, right_commands);
-        }
-    }
-}
-
-fn validateCommandTreeValueModeConflicts(comptime commands: anytype) void {
-    const fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
-    inline for (fields, 0..) |left_field, left_idx| {
-        const left_spec = @field(commands, left_field.name);
-        const LeftOpts = commandSpecOptions(left_spec);
-
-        inline for (fields[left_idx + 1 ..]) |right_field| {
-            const right_spec = @field(commands, right_field.name);
-            const RightOpts = commandSpecOptions(right_spec);
-
-            validateNoValueModeConflictBetween(LeftOpts, RightOpts);
-            if (comptime commandSpecIsBranch(left_spec)) {
-                validateCommandTreeValueModeAgainstScope(left_spec.commands, RightOpts);
-            }
-            if (comptime commandSpecIsBranch(right_spec)) {
-                validateCommandTreeValueModeAgainstScope(right_spec.commands, LeftOpts);
-            }
-            if (comptime commandSpecIsBranch(left_spec) and commandSpecIsBranch(right_spec)) {
-                validateCommandTreeValueModeBetweenTrees(left_spec.commands, right_spec.commands);
-            }
-        }
-
-        if (comptime commandSpecIsBranch(left_spec)) {
-            validateCommandTreeValueModeConflicts(left_spec.commands);
-        }
-    }
-}
-
 fn validateCommandTree(comptime commands: anytype) void {
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
@@ -290,76 +217,9 @@ fn validateCommandParserSpec(comptime spec: anytype) void {
     options.validateOptionStruct(spec.global);
     validateCommandsAgainstScope(spec.commands, spec.global);
     validateCommandTree(spec.commands);
-    validateCommandTreeValueModeConflicts(spec.commands);
 }
 
-fn longValueModeInCommandTree(comptime commands: anytype, name: []const u8) ?scanner.ValueMode {
-    var mode: ?scanner.ValueMode = null;
-    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
-        const command_spec = @field(commands, field.name);
-        const Opts = commandSpecOptions(command_spec);
-        const opt_fields = @typeInfo(Opts).@"struct".fields;
-        const has_meta = @hasDecl(Opts, "meta");
-        mode = options.combineValueMode(mode, options.longOptionValueMode(Opts, opt_fields, has_meta, name));
-        if (mode == .required) return .required;
-        if (comptime commandSpecIsBranch(command_spec)) {
-            mode = options.combineValueMode(mode, longValueModeInCommandTree(command_spec.commands, name));
-            if (mode == .required) return .required;
-        }
-    }
-    return mode;
-}
-
-fn shortValueModeInCommandTree(comptime commands: anytype, short: u8) ?scanner.ValueMode {
-    var mode: ?scanner.ValueMode = null;
-    inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
-        const command_spec = @field(commands, field.name);
-        const Opts = commandSpecOptions(command_spec);
-        const opt_fields = @typeInfo(Opts).@"struct".fields;
-        const has_meta = @hasDecl(Opts, "meta");
-        mode = options.combineValueMode(mode, options.shortOptionValueMode(Opts, opt_fields, has_meta, short));
-        if (mode == .required) return .required;
-        if (comptime commandSpecIsBranch(command_spec)) {
-            mode = options.combineValueMode(mode, shortValueModeInCommandTree(command_spec.commands, short));
-            if (mode == .required) return .required;
-        }
-    }
-    return mode;
-}
-
-fn longValueModeInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), name: []const u8) ?scanner.ValueMode {
-    switch (command.*) {
-        inline else => |*payload, tag| {
-            const command_spec = @field(commands, @tagName(tag));
-            const Opts = commandSpecOptions(command_spec);
-            const opt_fields = @typeInfo(Opts).@"struct".fields;
-            const has_meta = @hasDecl(Opts, "meta");
-            var mode = options.longOptionValueMode(Opts, opt_fields, has_meta, name);
-            if (comptime commandSpecIsBranch(command_spec)) {
-                mode = options.combineValueMode(mode, longValueModeInSelectedCommand(command_spec.commands, &payload.command, name));
-            }
-            return mode;
-        },
-    }
-}
-
-fn shortValueModeInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), short: u8) ?scanner.ValueMode {
-    switch (command.*) {
-        inline else => |*payload, tag| {
-            const command_spec = @field(commands, @tagName(tag));
-            const Opts = commandSpecOptions(command_spec);
-            const opt_fields = @typeInfo(Opts).@"struct".fields;
-            const has_meta = @hasDecl(Opts, "meta");
-            var mode = options.shortOptionValueMode(Opts, opt_fields, has_meta, short);
-            if (comptime commandSpecIsBranch(command_spec)) {
-                mode = options.combineValueMode(mode, shortValueModeInSelectedCommand(command_spec.commands, &payload.command, short));
-            }
-            return mode;
-        },
-    }
-}
-
-fn CommandDiscoveryResolver(comptime G: type, comptime Scope: type, comptime commands: anytype) type {
+fn VisibleResolver(comptime G: type, comptime Scope: type) type {
     return struct {
         const g_fields = @typeInfo(G).@"struct".fields;
         const g_has_meta = @hasDecl(G, "meta");
@@ -368,123 +228,137 @@ fn CommandDiscoveryResolver(comptime G: type, comptime Scope: type, comptime com
 
         pub fn longValueMode(_: @This(), name: []const u8) ?scanner.ValueMode {
             return options.combineValueMode(
-                options.combineValueMode(options.longOptionValueMode(G, g_fields, g_has_meta, name), if (Scope != void) options.longOptionValueMode(Scope, scope_fields, scope_has_meta, name) else null),
-                longValueModeInCommandTree(commands, name),
+                options.longOptionValueMode(G, g_fields, g_has_meta, name),
+                if (Scope != void) options.longOptionValueMode(Scope, scope_fields, scope_has_meta, name) else null,
             );
         }
 
         pub fn shortValueMode(_: @This(), short: u8) ?scanner.ValueMode {
             return options.combineValueMode(
-                options.combineValueMode(options.shortOptionValueMode(G, g_fields, g_has_meta, short), if (Scope != void) options.shortOptionValueMode(Scope, scope_fields, scope_has_meta, short) else null),
-                shortValueModeInCommandTree(commands, short),
+                options.shortOptionValueMode(G, g_fields, g_has_meta, short),
+                if (Scope != void) options.shortOptionValueMode(Scope, scope_fields, scope_has_meta, short) else null,
             );
         }
     };
 }
 
-fn SelectedCommandResolver(comptime G: type, comptime commands: anytype) type {
-    return struct {
-        command: *const commandUnion(commands),
-
-        const g_fields = @typeInfo(G).@"struct".fields;
-        const g_has_meta = @hasDecl(G, "meta");
-
-        pub fn longValueMode(self: @This(), name: []const u8) ?scanner.ValueMode {
-            return options.combineValueMode(options.longOptionValueMode(G, g_fields, g_has_meta, name), longValueModeInSelectedCommand(commands, self.command, name));
-        }
-
-        pub fn shortValueMode(self: @This(), short: u8) ?scanner.ValueMode {
-            return options.combineValueMode(options.shortOptionValueMode(G, g_fields, g_has_meta, short), shortValueModeInSelectedCommand(commands, self.command, short));
-        }
-    };
-}
-
-fn selectedCommandIndex(comptime commands: anytype, command: *const commandUnion(commands), root_index: usize, idx: usize) bool {
-    if (idx == root_index) return true;
-    switch (command.*) {
-        inline else => |*payload, tag| {
-            const command_spec = @field(commands, @tagName(tag));
-            if (comptime commandSpecIsBranch(command_spec)) {
-                if (idx == payload.command_index) return true;
-                return selectedCommandIndex(command_spec.commands, &payload.command, payload.command_index, idx);
-            }
-            return false;
-        },
-    }
-}
-
-fn setLongInSelectedCommand(
-    comptime commands: anytype,
-    command: *commandUnion(commands),
+fn setLongInVisible(
+    comptime G: type,
+    comptime Scope: type,
+    global: *G,
+    scope: ?*Scope,
     name: []const u8,
     is_negated: bool,
     value: ?[]const u8,
 ) errors.ParseError!bool {
-    switch (command.*) {
-        inline else => |*payload, tag| {
-            const command_spec = @field(commands, @tagName(tag));
-            const Opts = commandSpecOptions(command_spec);
-            const fields = @typeInfo(Opts).@"struct".fields;
-            const has_meta = @hasDecl(Opts, "meta");
-            const found = try if (is_negated)
-                options.setFieldNegated(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name)
-            else
-                options.setField(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name, value);
-            if (found) return true;
-            if (comptime commandSpecIsBranch(command_spec)) {
-                return setLongInSelectedCommand(command_spec.commands, &payload.command, name, is_negated, value);
-            }
-            return false;
-        },
+    const g_fields = @typeInfo(G).@"struct".fields;
+    const g_has_meta = @hasDecl(G, "meta");
+    const global_found = try if (is_negated)
+        options.setFieldNegated(G, g_fields, g_has_meta, global, name)
+    else
+        options.setField(G, g_fields, g_has_meta, global, name, value);
+    if (global_found) return true;
+
+    if (comptime Scope != void) {
+        const scope_fields = @typeInfo(Scope).@"struct".fields;
+        const scope_has_meta = @hasDecl(Scope, "meta");
+        return try if (is_negated)
+            options.setFieldNegated(Scope, scope_fields, scope_has_meta, scope.?, name)
+        else
+            options.setField(Scope, scope_fields, scope_has_meta, scope.?, name, value);
     }
+
+    return false;
 }
 
-fn setShortInSelectedCommand(
-    comptime commands: anytype,
-    command: *commandUnion(commands),
+fn setShortInVisible(
+    comptime G: type,
+    comptime Scope: type,
+    global: *G,
+    scope: ?*Scope,
     short: u8,
     value: ?[]const u8,
 ) errors.ParseError!bool {
-    switch (command.*) {
-        inline else => |*payload, tag| {
-            const command_spec = @field(commands, @tagName(tag));
-            const Opts = commandSpecOptions(command_spec);
-            const fields = @typeInfo(Opts).@"struct".fields;
-            const has_meta = @hasDecl(Opts, "meta");
-            const found = try options.setFieldByShort(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, short, value);
-            if (found) return true;
-            if (comptime commandSpecIsBranch(command_spec)) {
-                return setShortInSelectedCommand(command_spec.commands, &payload.command, short, value);
-            }
-            return false;
-        },
+    const g_fields = @typeInfo(G).@"struct".fields;
+    const g_has_meta = @hasDecl(G, "meta");
+    const global_found = try options.setFieldByShort(G, g_fields, g_has_meta, global, short, value);
+    if (global_found) return true;
+
+    if (comptime Scope != void) {
+        const scope_fields = @typeInfo(Scope).@"struct".fields;
+        const scope_has_meta = @hasDecl(Scope, "meta");
+        return try options.setFieldByShort(Scope, scope_fields, scope_has_meta, scope.?, short, value);
+    }
+
+    return false;
+}
+
+fn setOptionInVisible(
+    comptime G: type,
+    comptime Scope: type,
+    global: *G,
+    scope: ?*Scope,
+    opt: scanner.OptionToken,
+) errors.ParseError!bool {
+    return switch (opt.key) {
+        .long => |name| setLongInVisible(G, Scope, global, scope, name, opt.negated, opt.value),
+        .short => |short| setShortInVisible(G, Scope, global, scope, short, opt.value),
+    };
+}
+
+fn parseRemainingInVisible(
+    comptime G: type,
+    comptime Scope: type,
+    global: *G,
+    scope: *Scope,
+    arg_scanner: *scanner.ArgScanner,
+    positionals_buf: [][]const u8,
+    pos_idx: *usize,
+) errors.ParseError!void {
+    const resolver = VisibleResolver(G, Scope){};
+    while (arg_scanner.next(resolver)) |token| {
+        switch (token) {
+            .help => return errors.ParseError.Help,
+            .end_options => {},
+            .positional => |pos| try appendPositional(positionals_buf, pos_idx, pos.value),
+            .option => |opt| {
+                const found = try setOptionInVisible(G, Scope, global, scope, opt);
+                if (!found) return errors.ParseError.UnknownOption;
+            },
+        }
     }
 }
 
-fn discoverCommand(
+fn parseCommandIn(
     comptime G: type,
     comptime Scope: type,
     comptime commands: anytype,
-    args: []const []const u8,
-    start_index: usize,
+    global: *G,
+    scope: ?*Scope,
+    arg_scanner: *scanner.ArgScanner,
+    positionals_buf: [][]const u8,
+    pos_idx: *usize,
 ) errors.ParseError!commandFound(commands) {
     const command_fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
 
-    var arg_scanner = scanner.ArgScanner.init(args, start_index);
-    const resolver = CommandDiscoveryResolver(G, Scope, commands){};
+    const resolver = VisibleResolver(G, Scope){};
     while (arg_scanner.next(resolver)) |token| {
         switch (token) {
             .help => return errors.ParseError.Help,
             .end_options => return errors.ParseError.MissingCommand,
-            .option => {},
+            .option => |opt| {
+                const found = try setOptionInVisible(G, Scope, global, scope, opt);
+                if (!found) return errors.ParseError.UnknownOption;
+            },
             .positional => |pos| {
                 inline for (command_fields) |field| {
                     if (commandNameMatches(field.name, pos.value)) {
                         const command_spec = @field(commands, field.name);
                         if (comptime commandSpecIsBranch(command_spec)) {
-                            const child = try discoverCommand(G, command_spec.options, command_spec.commands, args, pos.index + 1);
+                            var branch_options = command_spec.options{};
+                            const child = try parseCommandIn(G, command_spec.options, command_spec.commands, global, &branch_options, arg_scanner, positionals_buf, pos_idx);
                             const payload: commandPayloadType(command_spec) = .{
-                                .options = command_spec.options{},
+                                .options = branch_options,
                                 .command_name = child.command_name,
                                 .command_index = child.command_index,
                                 .command = child.command,
@@ -495,8 +369,10 @@ fn discoverCommand(
                                 .command_index = pos.index,
                             };
                         } else {
+                            var command_options = command_spec{};
+                            try parseRemainingInVisible(G, command_spec, global, &command_options, arg_scanner, positionals_buf, pos_idx);
                             return .{
-                                .command = @unionInit(commandUnion(commands), field.name, command_spec{}),
+                                .command = @unionInit(commandUnion(commands), field.name, command_options),
                                 .command_name = pos.value,
                                 .command_index = pos.index,
                             };
@@ -509,51 +385,6 @@ fn discoverCommand(
     }
 
     return errors.ParseError.MissingCommand;
-}
-
-fn parseSelectedCommand(
-    comptime G: type,
-    comptime commands: anytype,
-    global: *G,
-    command: *commandUnion(commands),
-    root_command_index: usize,
-    args: []const []const u8,
-    positionals_buf: [][]const u8,
-) errors.ParseError![]const []const u8 {
-    const g_fields = @typeInfo(G).@"struct".fields;
-    const g_has_meta = @hasDecl(G, "meta");
-
-    var pos_idx: usize = 0;
-    var arg_scanner = scanner.ArgScanner.init(args, 0);
-    const resolver = SelectedCommandResolver(G, commands){ .command = command };
-    while (arg_scanner.next(resolver)) |token| {
-        switch (token) {
-            .help => return errors.ParseError.Help,
-            .end_options => {},
-            .positional => |pos| {
-                if (selectedCommandIndex(commands, command, root_command_index, pos.index)) continue;
-                try appendPositional(positionals_buf, &pos_idx, pos.value);
-            },
-            .option => |opt| {
-                const global_found = try switch (opt.key) {
-                    .long => |name| if (opt.negated)
-                        options.setFieldNegated(G, g_fields, g_has_meta, global, name)
-                    else
-                        options.setField(G, g_fields, g_has_meta, global, name, opt.value),
-                    .short => |short| options.setFieldByShort(G, g_fields, g_has_meta, global, short, opt.value),
-                };
-                if (global_found) continue;
-
-                const command_found = try switch (opt.key) {
-                    .long => |name| setLongInSelectedCommand(commands, command, name, opt.negated, opt.value),
-                    .short => |short| setShortInSelectedCommand(commands, command, short, opt.value),
-                };
-                if (!command_found) return errors.ParseError.UnknownOption;
-            },
-        }
-    }
-
-    return positionals_buf[0..pos_idx];
 }
 
 pub fn CommandParser(comptime spec: anytype) type {
@@ -577,14 +408,15 @@ pub fn CommandParser(comptime spec: anytype) type {
 
         pub fn parse(args: []const []const u8, positionals_buf: [][]const u8) errors.ParseError!Result {
             var global = Global{};
-            var found = try discoverCommand(Global, void, spec.commands, args, 0);
-            const positionals = try parseSelectedCommand(Global, spec.commands, &global, &found.command, found.command_index, args, positionals_buf);
+            var arg_scanner = scanner.ArgScanner.init(args, 0);
+            var pos_idx: usize = 0;
+            const found = try parseCommandIn(Global, void, spec.commands, &global, null, &arg_scanner, positionals_buf, &pos_idx);
             return .{
                 .global = global,
                 .command = found.command,
                 .command_name = found.command_name,
                 .command_index = found.command_index,
-                .positionals = positionals,
+                .positionals = positionals_buf[0..pos_idx],
             };
         }
 
@@ -919,6 +751,50 @@ test "CommandParser supports nested command groups" {
     try std.testing.expectEqualStrings("pos1", parsed.positionals[0]);
 
     try std.testing.expectError(errors.ParseError.MissingCommand, Cli.parse(&.{ "service", "--", "restart" }, &positionals));
+    try std.testing.expectError(errors.ParseError.UnknownOption, Cli.parse(&.{ "service", "--force", "restart" }, &positionals));
+    try std.testing.expectError(errors.ParseError.UnknownOption, Cli.parse(&.{ "service", "restart", "--name", "cam" }, &positionals));
+}
+
+test "CommandParser rejects command options before the command name" {
+    const Global = struct {};
+    const Restart = struct {
+        force: bool = false,
+        pub const meta = .{ .force = .{ .short = 'f' } };
+    };
+    const Cli = CommandParser(.{
+        .global = Global,
+        .commands = .{ .restart = Restart },
+    });
+
+    var positionals: [256][]const u8 = undefined;
+    try std.testing.expectError(errors.ParseError.UnknownOption, Cli.parse(&.{ "--force", "restart" }, &positionals));
+    try std.testing.expectError(errors.ParseError.UnknownOption, Cli.parse(&.{ "-f", "restart" }, &positionals));
+}
+
+test "CommandParser allows sibling commands to reuse option spelling" {
+    const Global = struct {};
+    const Build = struct {
+        output: []const u8 = "",
+        pub const meta = .{ .output = .{ .short = 'x' } };
+    };
+    const Status = struct {
+        execute: bool = false,
+        pub const meta = .{ .execute = .{ .short = 'x' } };
+    };
+    const Cli = CommandParser(.{
+        .global = Global,
+        .commands = .{
+            .build = Build,
+            .status = Status,
+        },
+    });
+
+    var positionals: [256][]const u8 = undefined;
+    const build = try Cli.parse(&.{ "build", "-x", "zig-out" }, &positionals);
+    try std.testing.expectEqualStrings("zig-out", build.command.build.output);
+
+    const status = try Cli.parse(&.{ "status", "-x" }, &positionals);
+    try std.testing.expect(status.command.status.execute);
 }
 
 test "repeatable option appends" {

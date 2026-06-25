@@ -44,7 +44,7 @@ pub fn main() !void {
 - **Short and long options** - `-v` and `--verbose`
 - **Inline values** - `-p8080` and `--port=8080`
 - **Negation with `--no-*`** - `--no-verbose` sets bool to false, `--no-config` sets optional to null
-- **Value-optional flags** - `--compress` alone vs `--compress=gzip` via `flag_value`
+- **Value-optional flags** - `--compress` alone vs inline values like `--compress=gzip` via `flag_value`
 - **Custom parsers** - `parse` in meta for octal, special formats, validation
 - **Repeatable options** - `Multi(T, capacity)` for `-x foo -x bar`
 - **Subcommands** - `CommandParser` for git-style and nested command CLIs
@@ -78,7 +78,7 @@ Parse args into struct. Returns positional arguments stored in the caller-owned 
 
 ### `CommandParser(spec) type`
 
-Generate a parser for global options plus one or more command levels. Commands and options are defined with normal Zig structs.
+Generate a parser for global options plus one or more command levels. Commands and options are defined with normal Zig structs. Global options are visible before commands; command options become visible only after their command name.
 
 ```zig
 const Cli = opt.CommandParser(.{
@@ -122,7 +122,7 @@ pub const meta = .{
 };
 ```
 
-`meta` entries must correspond to real fields, and duplicate short options in the same option struct are compile errors. For `CommandParser`, duplicate option names/shorts on the same visible command path are compile errors; sibling commands may reuse a spelling only when it has the same value arity.
+`meta` entries must correspond to real fields, and duplicate short options in the same option struct are compile errors. For `CommandParser`, duplicate option names/shorts on the same visible command path are compile errors; sibling commands may reuse option spellings because only the selected command path is visible.
 
 Optional `about` decl for program info:
 
@@ -136,14 +136,14 @@ pub const about = .{
 
 ## Positional arguments
 
-Options are parsed until the first positional argument. After that, everything is positional:
+Options are parsed throughout the argument list, and non-option arguments are returned as positionals:
 
 ```zig
-// myapp --verbose file1 --unknown file2
-// Result: verbose=true, positionals=["file1", "--unknown", "file2"]
+// myapp --verbose file1 --output out.txt file2
+// Result: verbose=true, output="out.txt", positionals=["file1", "file2"]
 ```
 
-Use `--` to explicitly end options when you have no positionals before:
+Use `--` to explicitly end option parsing:
 
 ```zig
 // myapp -v -- --not-an-option
@@ -264,8 +264,10 @@ switch (parsed.command) {
 }
 ```
 
-Command discovery is option-schema aware, so valued options before commands work:
+Command parsing is strict about option visibility: global options are visible while looking for commands, but a command's options are only visible after that command name. For nested commands, parent command options must appear before the nested command name.
 
 ```sh
-myapp --service cam service restart
+myapp --service cam service --name cam restart --force
 ```
+
+Command-specific options before their command name are rejected, so `myapp --force restart` is an unknown option unless `force` is global.
