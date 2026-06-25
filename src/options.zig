@@ -3,48 +3,54 @@ const scanner = @import("scanner.zig");
 const errors = @import("errors.zig");
 
 /// Option-struct reflection, metadata lookup, value parsing, and field binding.
-pub fn fieldArity(comptime field: std.builtin.Type.StructField) scanner.OptionArity {
-    if (field.type == bool) return .flag;
-    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return .flag;
-    return .value;
+pub fn fieldValueMode(comptime T: type, comptime field: std.builtin.Type.StructField) scanner.ValueMode {
+    if (field.type == bool) return .none;
+    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return .none;
+
+    if (@hasDecl(T, "meta") and @hasField(@TypeOf(T.meta), field.name)) {
+        const field_meta = @field(T.meta, field.name);
+        if (@hasField(@TypeOf(field_meta), "flag_value")) return .optional_inline;
+    }
+
+    return .required;
 }
 
-pub fn longOptionArity(
+pub fn longOptionValueMode(
     comptime T: type,
     comptime fields: []const std.builtin.Type.StructField,
     comptime has_meta: bool,
     name: []const u8,
-) ?scanner.OptionArity {
-    _ = T;
+) ?scanner.ValueMode {
     _ = has_meta;
     inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) return fieldArity(field);
+        if (std.mem.eql(u8, field.name, name)) return fieldValueMode(T, field);
     }
     return null;
 }
 
-pub fn shortOptionArity(
+pub fn shortOptionValueMode(
     comptime T: type,
     comptime fields: []const std.builtin.Type.StructField,
     comptime has_meta: bool,
     short: u8,
-) ?scanner.OptionArity {
+) ?scanner.ValueMode {
     if (!has_meta) return null;
 
     inline for (fields) |field| {
         if (@hasField(@TypeOf(T.meta), field.name)) {
             const field_meta = @field(T.meta, field.name);
             if (@hasField(@TypeOf(field_meta), "short") and field_meta.short == short) {
-                return fieldArity(field);
+                return fieldValueMode(T, field);
             }
         }
     }
     return null;
 }
 
-pub fn combineArity(a: ?scanner.OptionArity, b: ?scanner.OptionArity) ?scanner.OptionArity {
-    if (a == .value or b == .value) return .value;
-    if (a != null or b != null) return .flag;
+pub fn combineValueMode(a: ?scanner.ValueMode, b: ?scanner.ValueMode) ?scanner.ValueMode {
+    if (a == .required or b == .required) return .required;
+    if (a == .optional_inline or b == .optional_inline) return .optional_inline;
+    if (a != null or b != null) return .none;
     return null;
 }
 
@@ -53,12 +59,12 @@ pub fn OptionStructResolver(comptime T: type) type {
         const fields = @typeInfo(T).@"struct".fields;
         const has_meta = @hasDecl(T, "meta");
 
-        pub fn longArity(_: @This(), name: []const u8) ?scanner.OptionArity {
-            return longOptionArity(T, fields, has_meta, name);
+        pub fn longValueMode(_: @This(), name: []const u8) ?scanner.ValueMode {
+            return longOptionValueMode(T, fields, has_meta, name);
         }
 
-        pub fn shortArity(_: @This(), short: u8) ?scanner.OptionArity {
-            return shortOptionArity(T, fields, has_meta, short);
+        pub fn shortValueMode(_: @This(), short: u8) ?scanner.ValueMode {
+            return shortOptionValueMode(T, fields, has_meta, short);
         }
     };
 }
@@ -164,6 +170,11 @@ fn setValue(
 
     // Bool fields are flags (no value needed)
     if (F == bool) {
+        @field(opts, field.name) = true;
+        return;
+    }
+
+    if (@typeInfo(F) == .optional and @typeInfo(F).optional.child == bool and value == null) {
         @field(opts, field.name) = true;
         return;
     }

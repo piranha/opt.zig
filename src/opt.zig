@@ -201,22 +201,22 @@ fn validateCommandsAgainstScope(comptime commands: anytype, comptime Scope: type
     }
 }
 
-fn validateNoArityConflictBetween(comptime A: type, comptime B: type) void {
+fn validateNoValueModeConflictBetween(comptime A: type, comptime B: type) void {
     const a_fields = @typeInfo(A).@"struct".fields;
     const b_fields = @typeInfo(B).@"struct".fields;
 
     inline for (a_fields) |a_field| {
         inline for (b_fields) |b_field| {
-            if (std.mem.eql(u8, a_field.name, b_field.name) and options.fieldArity(a_field) != options.fieldArity(b_field)) {
-                @compileError("option has conflicting arity in command tree: " ++ @typeName(A) ++ "." ++ a_field.name ++ " and " ++ @typeName(B) ++ "." ++ b_field.name);
+            if (std.mem.eql(u8, a_field.name, b_field.name) and options.fieldValueMode(A, a_field) != options.fieldValueMode(B, b_field)) {
+                @compileError("option has conflicting mode in command tree: " ++ @typeName(A) ++ "." ++ a_field.name ++ " and " ++ @typeName(B) ++ "." ++ b_field.name);
             }
         }
 
         if (options.optionShort(A, a_field)) |a_short| {
             inline for (b_fields) |b_field| {
                 if (options.optionShort(B, b_field)) |b_short| {
-                    if (a_short == b_short and options.fieldArity(a_field) != options.fieldArity(b_field)) {
-                        @compileError("short option has conflicting arity in command tree between " ++ @typeName(A) ++ " and " ++ @typeName(B));
+                    if (a_short == b_short and options.fieldValueMode(A, a_field) != options.fieldValueMode(B, b_field)) {
+                        @compileError("short option has conflicting mode in command tree between " ++ @typeName(A) ++ " and " ++ @typeName(B));
                     }
                 }
             }
@@ -224,29 +224,29 @@ fn validateNoArityConflictBetween(comptime A: type, comptime B: type) void {
     }
 }
 
-fn validateCommandTreeArityAgainstScope(comptime commands: anytype, comptime Scope: type) void {
+fn validateCommandTreeValueModeAgainstScope(comptime commands: anytype, comptime Scope: type) void {
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
         const Opts = commandSpecOptions(command_spec);
-        validateNoArityConflictBetween(Scope, Opts);
+        validateNoValueModeConflictBetween(Scope, Opts);
         if (comptime commandSpecIsBranch(command_spec)) {
-            validateCommandTreeArityAgainstScope(command_spec.commands, Scope);
+            validateCommandTreeValueModeAgainstScope(command_spec.commands, Scope);
         }
     }
 }
 
-fn validateCommandTreeArityBetweenTrees(comptime left_commands: anytype, comptime right_commands: anytype) void {
+fn validateCommandTreeValueModeBetweenTrees(comptime left_commands: anytype, comptime right_commands: anytype) void {
     inline for (@typeInfo(@TypeOf(left_commands)).@"struct".fields) |field| {
         const command_spec = @field(left_commands, field.name);
         const Opts = commandSpecOptions(command_spec);
-        validateCommandTreeArityAgainstScope(right_commands, Opts);
+        validateCommandTreeValueModeAgainstScope(right_commands, Opts);
         if (comptime commandSpecIsBranch(command_spec)) {
-            validateCommandTreeArityBetweenTrees(command_spec.commands, right_commands);
+            validateCommandTreeValueModeBetweenTrees(command_spec.commands, right_commands);
         }
     }
 }
 
-fn validateCommandTreeArityConflicts(comptime commands: anytype) void {
+fn validateCommandTreeValueModeConflicts(comptime commands: anytype) void {
     const fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
     inline for (fields, 0..) |left_field, left_idx| {
         const left_spec = @field(commands, left_field.name);
@@ -256,20 +256,20 @@ fn validateCommandTreeArityConflicts(comptime commands: anytype) void {
             const right_spec = @field(commands, right_field.name);
             const RightOpts = commandSpecOptions(right_spec);
 
-            validateNoArityConflictBetween(LeftOpts, RightOpts);
+            validateNoValueModeConflictBetween(LeftOpts, RightOpts);
             if (comptime commandSpecIsBranch(left_spec)) {
-                validateCommandTreeArityAgainstScope(left_spec.commands, RightOpts);
+                validateCommandTreeValueModeAgainstScope(left_spec.commands, RightOpts);
             }
             if (comptime commandSpecIsBranch(right_spec)) {
-                validateCommandTreeArityAgainstScope(right_spec.commands, LeftOpts);
+                validateCommandTreeValueModeAgainstScope(right_spec.commands, LeftOpts);
             }
             if (comptime commandSpecIsBranch(left_spec) and commandSpecIsBranch(right_spec)) {
-                validateCommandTreeArityBetweenTrees(left_spec.commands, right_spec.commands);
+                validateCommandTreeValueModeBetweenTrees(left_spec.commands, right_spec.commands);
             }
         }
 
         if (comptime commandSpecIsBranch(left_spec)) {
-            validateCommandTreeArityConflicts(left_spec.commands);
+            validateCommandTreeValueModeConflicts(left_spec.commands);
         }
     }
 }
@@ -290,71 +290,71 @@ fn validateCommandParserSpec(comptime spec: anytype) void {
     options.validateOptionStruct(spec.global);
     validateCommandsAgainstScope(spec.commands, spec.global);
     validateCommandTree(spec.commands);
-    validateCommandTreeArityConflicts(spec.commands);
+    validateCommandTreeValueModeConflicts(spec.commands);
 }
 
-fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?scanner.OptionArity {
-    var arity: ?scanner.OptionArity = null;
+fn longValueModeInCommandTree(comptime commands: anytype, name: []const u8) ?scanner.ValueMode {
+    var mode: ?scanner.ValueMode = null;
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
         const Opts = commandSpecOptions(command_spec);
         const opt_fields = @typeInfo(Opts).@"struct".fields;
         const has_meta = @hasDecl(Opts, "meta");
-        arity = options.combineArity(arity, options.longOptionArity(Opts, opt_fields, has_meta, name));
-        if (arity == .value) return .value;
+        mode = options.combineValueMode(mode, options.longOptionValueMode(Opts, opt_fields, has_meta, name));
+        if (mode == .required) return .required;
         if (comptime commandSpecIsBranch(command_spec)) {
-            arity = options.combineArity(arity, longArityInCommandTree(command_spec.commands, name));
-            if (arity == .value) return .value;
+            mode = options.combineValueMode(mode, longValueModeInCommandTree(command_spec.commands, name));
+            if (mode == .required) return .required;
         }
     }
-    return arity;
+    return mode;
 }
 
-fn shortArityInCommandTree(comptime commands: anytype, short: u8) ?scanner.OptionArity {
-    var arity: ?scanner.OptionArity = null;
+fn shortValueModeInCommandTree(comptime commands: anytype, short: u8) ?scanner.ValueMode {
+    var mode: ?scanner.ValueMode = null;
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
         const Opts = commandSpecOptions(command_spec);
         const opt_fields = @typeInfo(Opts).@"struct".fields;
         const has_meta = @hasDecl(Opts, "meta");
-        arity = options.combineArity(arity, options.shortOptionArity(Opts, opt_fields, has_meta, short));
-        if (arity == .value) return .value;
+        mode = options.combineValueMode(mode, options.shortOptionValueMode(Opts, opt_fields, has_meta, short));
+        if (mode == .required) return .required;
         if (comptime commandSpecIsBranch(command_spec)) {
-            arity = options.combineArity(arity, shortArityInCommandTree(command_spec.commands, short));
-            if (arity == .value) return .value;
+            mode = options.combineValueMode(mode, shortValueModeInCommandTree(command_spec.commands, short));
+            if (mode == .required) return .required;
         }
     }
-    return arity;
+    return mode;
 }
 
-fn longArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), name: []const u8) ?scanner.OptionArity {
+fn longValueModeInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), name: []const u8) ?scanner.ValueMode {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
             const Opts = commandSpecOptions(command_spec);
             const opt_fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            var arity = options.longOptionArity(Opts, opt_fields, has_meta, name);
+            var mode = options.longOptionValueMode(Opts, opt_fields, has_meta, name);
             if (comptime commandSpecIsBranch(command_spec)) {
-                arity = options.combineArity(arity, longArityInSelectedCommand(command_spec.commands, &payload.command, name));
+                mode = options.combineValueMode(mode, longValueModeInSelectedCommand(command_spec.commands, &payload.command, name));
             }
-            return arity;
+            return mode;
         },
     }
 }
 
-fn shortArityInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), short: u8) ?scanner.OptionArity {
+fn shortValueModeInSelectedCommand(comptime commands: anytype, command: *const commandUnion(commands), short: u8) ?scanner.ValueMode {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
             const Opts = commandSpecOptions(command_spec);
             const opt_fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            var arity = options.shortOptionArity(Opts, opt_fields, has_meta, short);
+            var mode = options.shortOptionValueMode(Opts, opt_fields, has_meta, short);
             if (comptime commandSpecIsBranch(command_spec)) {
-                arity = options.combineArity(arity, shortArityInSelectedCommand(command_spec.commands, &payload.command, short));
+                mode = options.combineValueMode(mode, shortValueModeInSelectedCommand(command_spec.commands, &payload.command, short));
             }
-            return arity;
+            return mode;
         },
     }
 }
@@ -366,17 +366,17 @@ fn CommandDiscoveryResolver(comptime G: type, comptime Scope: type, comptime com
         const scope_fields = if (Scope != void) @typeInfo(Scope).@"struct".fields else &[_]std.builtin.Type.StructField{};
         const scope_has_meta = if (Scope != void) @hasDecl(Scope, "meta") else false;
 
-        pub fn longArity(_: @This(), name: []const u8) ?scanner.OptionArity {
-            return options.combineArity(
-                options.combineArity(options.longOptionArity(G, g_fields, g_has_meta, name), if (Scope != void) options.longOptionArity(Scope, scope_fields, scope_has_meta, name) else null),
-                longArityInCommandTree(commands, name),
+        pub fn longValueMode(_: @This(), name: []const u8) ?scanner.ValueMode {
+            return options.combineValueMode(
+                options.combineValueMode(options.longOptionValueMode(G, g_fields, g_has_meta, name), if (Scope != void) options.longOptionValueMode(Scope, scope_fields, scope_has_meta, name) else null),
+                longValueModeInCommandTree(commands, name),
             );
         }
 
-        pub fn shortArity(_: @This(), short: u8) ?scanner.OptionArity {
-            return options.combineArity(
-                options.combineArity(options.shortOptionArity(G, g_fields, g_has_meta, short), if (Scope != void) options.shortOptionArity(Scope, scope_fields, scope_has_meta, short) else null),
-                shortArityInCommandTree(commands, short),
+        pub fn shortValueMode(_: @This(), short: u8) ?scanner.ValueMode {
+            return options.combineValueMode(
+                options.combineValueMode(options.shortOptionValueMode(G, g_fields, g_has_meta, short), if (Scope != void) options.shortOptionValueMode(Scope, scope_fields, scope_has_meta, short) else null),
+                shortValueModeInCommandTree(commands, short),
             );
         }
     };
@@ -389,12 +389,12 @@ fn SelectedCommandResolver(comptime G: type, comptime commands: anytype) type {
         const g_fields = @typeInfo(G).@"struct".fields;
         const g_has_meta = @hasDecl(G, "meta");
 
-        pub fn longArity(self: @This(), name: []const u8) ?scanner.OptionArity {
-            return options.combineArity(options.longOptionArity(G, g_fields, g_has_meta, name), longArityInSelectedCommand(commands, self.command, name));
+        pub fn longValueMode(self: @This(), name: []const u8) ?scanner.ValueMode {
+            return options.combineValueMode(options.longOptionValueMode(G, g_fields, g_has_meta, name), longValueModeInSelectedCommand(commands, self.command, name));
         }
 
-        pub fn shortArity(self: @This(), short: u8) ?scanner.OptionArity {
-            return options.combineArity(options.shortOptionArity(G, g_fields, g_has_meta, short), shortArityInSelectedCommand(commands, self.command, short));
+        pub fn shortValueMode(self: @This(), short: u8) ?scanner.ValueMode {
+            return options.combineValueMode(options.shortOptionValueMode(G, g_fields, g_has_meta, short), shortValueModeInSelectedCommand(commands, self.command, short));
         }
     };
 }
@@ -807,6 +807,17 @@ test "enum field" {
     try std.testing.expectEqual(Mode.fast, opts.mode);
 }
 
+test "required values may start with dash" {
+    const Opts = struct {
+        offset: i8 = 0,
+    };
+
+    var opts = Opts{};
+    try parseNoPositionals(Opts, &opts, &.{ "--offset", "-1" });
+
+    try std.testing.expectEqual(@as(i8, -1), opts.offset);
+}
+
 test "CommandParser finds command after valued global option" {
     const Global = struct {
         service: []const u8 = "default",
@@ -1096,6 +1107,28 @@ test "flag_value and no_value together" {
     }
 }
 
+test "flag_value before command does not consume command name" {
+    const Compress = enum { off, on, auto };
+    const Global = struct {
+        compress: Compress = .auto,
+
+        pub const meta = .{
+            .compress = .{ .flag_value = .on },
+        };
+    };
+    const Run = struct {};
+    const Cli = CommandParser(.{
+        .global = Global,
+        .commands = .{ .run = Run },
+    });
+
+    var positionals: [2][]const u8 = undefined;
+    const parsed = try Cli.parse(&.{ "--compress", "run" }, &positionals);
+
+    try std.testing.expectEqual(Compress.on, parsed.global.compress);
+    try std.testing.expectEqualStrings("run", parsed.command_name);
+}
+
 test "flag_value followed by other flags" {
     const Compress = enum { off, on, auto };
     const Opts = struct {
@@ -1104,7 +1137,7 @@ test "flag_value followed by other flags" {
         level: u8 = 1,
 
         pub const meta = .{
-            .compress = .{ .flag_value = .on },
+            .compress = .{ .short = 'c', .flag_value = .on },
             .verbose = .{ .short = 'v' },
         };
     };
@@ -1123,6 +1156,33 @@ test "flag_value followed by other flags" {
         try parseNoPositionals(Opts, &opts, &.{ "--compress", "-v" });
         try std.testing.expectEqual(Compress.on, opts.compress);
         try std.testing.expect(opts.verbose);
+    }
+
+    // --compress followed by positional (not consumed as value)
+    {
+        var opts = Opts{};
+        var positionals: [2][]const u8 = undefined;
+        const rest = try parse(Opts, &opts, &.{ "--compress", "file" }, &positionals);
+        try std.testing.expectEqual(Compress.on, opts.compress);
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings("file", rest[0]);
+    }
+
+    // -c followed by positional (not consumed as value)
+    {
+        var opts = Opts{};
+        var positionals: [2][]const u8 = undefined;
+        const rest = try parse(Opts, &opts, &.{ "-c", "file" }, &positionals);
+        try std.testing.expectEqual(Compress.on, opts.compress);
+        try std.testing.expectEqual(@as(usize, 1), rest.len);
+        try std.testing.expectEqualStrings("file", rest[0]);
+    }
+
+    // Optional values are still accepted inline
+    {
+        var opts = Opts{};
+        try parseNoPositionals(Opts, &opts, &.{"-coff"});
+        try std.testing.expectEqual(Compress.off, opts.compress);
     }
 
     // --compress at end of args

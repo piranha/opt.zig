@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const OptionArity = enum { flag, value };
+pub const ValueMode = enum { none, required, optional_inline };
 
 pub const OptionKey = union(enum) {
     long: []const u8,
@@ -25,7 +25,7 @@ pub const ArgToken = union(enum) {
 };
 
 /// Owns argv tokenization: dash syntax, short bundles, --, help, and value consumption.
-/// Callers supply arity lookup so the scanner can stay syntax-focused while parsers
+/// Callers supply value-mode lookup so the scanner can stay syntax-focused while parsers
 /// decide what each emitted token means.
 pub const ArgScanner = struct {
     args: []const []const u8,
@@ -38,12 +38,10 @@ pub const ArgScanner = struct {
         return .{ .args = args, .i = start_index };
     }
 
-    fn takeNextValue(self: *ArgScanner) ?[]const u8 {
+    fn takeRequiredValue(self: *ArgScanner) ?[]const u8 {
         if (self.i + 1 >= self.args.len) return null;
-        const next_arg = self.args[self.i + 1];
-        if (next_arg.len > 0 and next_arg[0] == '-') return null;
         self.i += 1;
-        return next_arg;
+        return self.args[self.i];
     }
 
     pub fn next(self: *ArgScanner, resolver: anytype) ?ArgToken {
@@ -53,29 +51,30 @@ pub const ArgScanner = struct {
             if (self.short_i != 0) {
                 const current_index = self.i;
                 const short = arg[self.short_i];
-                const arity = resolver.shortArity(short);
+                const mode = resolver.shortValueMode(short);
 
-                if (arity == .flag) {
-                    self.short_i += 1;
-                    if (self.short_i >= arg.len) {
+                switch (mode orelse .none) {
+                    .none => {
+                        self.short_i += 1;
+                        if (self.short_i >= arg.len) {
+                            self.short_i = 0;
+                            self.i += 1;
+                        }
+                        return .{ .option = .{ .index = current_index, .key = .{ .short = short } } };
+                    },
+                    .required, .optional_inline => |value_mode| {
+                        var value: ?[]const u8 = null;
+                        if (self.short_i + 1 < arg.len) {
+                            value = arg[self.short_i + 1 ..];
+                        } else if (value_mode == .required) {
+                            value = self.takeRequiredValue();
+                        }
+
                         self.short_i = 0;
                         self.i += 1;
-                    }
-                    return .{ .option = .{ .index = current_index, .key = .{ .short = short } } };
+                        return .{ .option = .{ .index = current_index, .key = .{ .short = short }, .value = value } };
+                    },
                 }
-
-                var value: ?[]const u8 = null;
-                if (arity == .value) {
-                    if (self.short_i + 1 < arg.len) {
-                        value = arg[self.short_i + 1 ..];
-                    } else {
-                        value = self.takeNextValue();
-                    }
-                }
-
-                self.short_i = 0;
-                self.i += 1;
-                return .{ .option = .{ .index = current_index, .key = .{ .short = short }, .value = value } };
             }
 
             if (arg.len == 0) {
@@ -120,8 +119,8 @@ pub const ArgScanner = struct {
                 }
 
                 const norm_name = normalizeName(name, &self.name_buf);
-                if (!negated and !has_inline_value and resolver.longArity(norm_name) == .value) {
-                    value = self.takeNextValue();
+                if (!negated and !has_inline_value and resolver.longValueMode(norm_name) == .required) {
+                    value = self.takeRequiredValue();
                 }
 
                 self.i += 1;

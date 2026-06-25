@@ -174,7 +174,7 @@ const Opts = struct {
 
 ## Value-optional flags with `flag_value`
 
-Some flags work both with and without values (`--compress` vs `--compress=gzip`). Use `flag_value` in meta:
+Some flags work both with and without values (`--compress` vs `--compress=gzip`). Use `flag_value` in meta. The value is optional only when written inline; `--compress file` sets the flag value and leaves `file` positional.
 
 ```zig
 const Compress = enum { off, on, auto, gzip, lz4 };
