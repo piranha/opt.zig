@@ -24,47 +24,43 @@
 
 const std = @import("std");
 const scanner = @import("scanner.zig");
+const options = @import("options.zig");
+const errors = @import("errors.zig");
 
-pub const ParseError = error{
-    MissingValue,
-    InvalidValue,
-    UnknownOption,
-    MissingCommand,
-    UnknownCommand,
-    Help,
-    OutOfMemory,
-    TooManyValues,
-    TooManyPositionals,
-};
+pub const ParseError = errors.ParseError;
+
+pub fn Multi(comptime Elem: type, comptime capacity: usize) type {
+    return options.Multi(Elem, capacity);
+}
 
 /// Parse args into opts struct. Returns remaining positional args in positionals_buf.
-pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_buf: [][]const u8) ParseError![]const []const u8 {
-    comptime validateOptionStruct(T);
+pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_buf: [][]const u8) errors.ParseError![]const []const u8 {
+    comptime options.validateOptionStruct(T);
 
     const fields = @typeInfo(T).@"struct".fields;
     const has_meta = @hasDecl(T, "meta");
 
     var pos_idx: usize = 0;
     var arg_scanner = scanner.ArgScanner.init(args, 0);
-    const resolver = OptionStructResolver(T){};
+    const resolver = options.OptionStructResolver(T){};
     while (arg_scanner.next(resolver)) |token| {
         switch (token) {
-            .help => return ParseError.Help,
+            .help => return errors.ParseError.Help,
             .end_options => {},
             .positional => |pos| try appendPositional(positionals_buf, &pos_idx, pos.value),
             .option => |opt| {
                 const result = switch (opt.key) {
                     .long => |name| if (opt.negated)
-                        setFieldNegated(T, fields, has_meta, opts, name)
+                        options.setFieldNegated(T, fields, has_meta, opts, name)
                     else
-                        setField(T, fields, has_meta, opts, name, opt.value),
-                    .short => |short| setFieldByShort(T, fields, has_meta, opts, short, opt.value),
+                        options.setField(T, fields, has_meta, opts, name, opt.value),
+                    .short => |short| options.setFieldByShort(T, fields, has_meta, opts, short, opt.value),
                 };
                 switch (result) {
                     .ok => {},
-                    .missing_value => return ParseError.MissingValue,
-                    .invalid_value => return ParseError.InvalidValue,
-                    .not_found => return ParseError.UnknownOption,
+                    .missing_value => return errors.ParseError.MissingValue,
+                    .invalid_value => return errors.ParseError.InvalidValue,
+                    .not_found => return errors.ParseError.UnknownOption,
                 }
             },
         }
@@ -73,300 +69,10 @@ pub fn parse(comptime T: type, opts: *T, args: []const []const u8, positionals_b
     return positionals_buf[0..pos_idx];
 }
 
-fn appendPositional(positionals_buf: [][]const u8, pos_idx: *usize, arg: []const u8) ParseError!void {
-    if (pos_idx.* >= positionals_buf.len) return ParseError.TooManyPositionals;
+fn appendPositional(positionals_buf: [][]const u8, pos_idx: *usize, arg: []const u8) errors.ParseError!void {
+    if (pos_idx.* >= positionals_buf.len) return errors.ParseError.TooManyPositionals;
     positionals_buf[pos_idx.*] = arg;
     pos_idx.* += 1;
-}
-
-fn fieldArity(comptime field: std.builtin.Type.StructField) scanner.OptionArity {
-    if (field.type == bool) return .flag;
-    if (@typeInfo(field.type) == .optional and @typeInfo(field.type).optional.child == bool) return .flag;
-    return .value;
-}
-
-fn longOptionArity(
-    comptime T: type,
-    comptime fields: []const std.builtin.Type.StructField,
-    comptime has_meta: bool,
-    name: []const u8,
-) ?scanner.OptionArity {
-    _ = T;
-    _ = has_meta;
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) return fieldArity(field);
-    }
-    return null;
-}
-
-fn shortOptionArity(
-    comptime T: type,
-    comptime fields: []const std.builtin.Type.StructField,
-    comptime has_meta: bool,
-    short: u8,
-) ?scanner.OptionArity {
-    if (!has_meta) return null;
-
-    inline for (fields) |field| {
-        if (@hasField(@TypeOf(T.meta), field.name)) {
-            const field_meta = @field(T.meta, field.name);
-            if (@hasField(@TypeOf(field_meta), "short") and field_meta.short == short) {
-                return fieldArity(field);
-            }
-        }
-    }
-    return null;
-}
-
-fn combineArity(a: ?scanner.OptionArity, b: ?scanner.OptionArity) ?scanner.OptionArity {
-    if (a == .value or b == .value) return .value;
-    if (a != null or b != null) return .flag;
-    return null;
-}
-
-fn OptionStructResolver(comptime T: type) type {
-    return struct {
-        const fields = @typeInfo(T).@"struct".fields;
-        const has_meta = @hasDecl(T, "meta");
-
-        pub fn longArity(_: @This(), name: []const u8) ?scanner.OptionArity {
-            return longOptionArity(T, fields, has_meta, name);
-        }
-
-        pub fn shortArity(_: @This(), short: u8) ?scanner.OptionArity {
-            return shortOptionArity(T, fields, has_meta, short);
-        }
-    };
-}
-
-const FieldResult = enum { not_found, ok, missing_value, invalid_value };
-
-fn setField(
-    comptime T: type,
-    comptime fields: []const std.builtin.Type.StructField,
-    comptime has_meta: bool,
-    opts: *T,
-    name: []const u8,
-    value: ?[]const u8,
-) FieldResult {
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) {
-            setValue(T, opts, field, has_meta, value) catch |e| return switch (e) {
-                error.MissingValue => .missing_value,
-                else => .invalid_value,
-            };
-            return .ok;
-        }
-    }
-    return .not_found;
-}
-
-fn setFieldNegated(
-    comptime T: type,
-    comptime fields: []const std.builtin.Type.StructField,
-    comptime has_meta: bool,
-    opts: *T,
-    name: []const u8,
-) FieldResult {
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) {
-            setNegatedValue(T, opts, field, has_meta) catch return .invalid_value;
-            return .ok;
-        }
-    }
-    return .not_found;
-}
-
-fn setNegatedValue(
-    comptime T: type,
-    opts: *T,
-    comptime field: std.builtin.Type.StructField,
-    comptime has_meta: bool,
-) ParseError!void {
-    const F = field.type;
-
-    // Check for no_value in meta first
-    if (has_meta and @hasField(@TypeOf(T.meta), field.name)) {
-        const field_meta = @field(T.meta, field.name);
-        if (@hasField(@TypeOf(field_meta), "no_value")) {
-            @field(opts, field.name) = field_meta.no_value;
-            return;
-        }
-    }
-
-    // Bool fields: --no-foo sets to false
-    if (F == bool) {
-        @field(opts, field.name) = false;
-        return;
-    }
-
-    // Optional fields: --no-foo sets to null
-    if (@typeInfo(F) == .optional) {
-        @field(opts, field.name) = null;
-        return;
-    }
-
-    // No no_value in meta and not bool/optional - error
-    return ParseError.InvalidValue;
-}
-
-fn setFieldByShort(
-    comptime T: type,
-    comptime fields: []const std.builtin.Type.StructField,
-    comptime has_meta: bool,
-    opts: *T,
-    short: u8,
-    value: ?[]const u8,
-) FieldResult {
-    if (!has_meta) return .not_found;
-
-    inline for (fields) |field| {
-        if (@hasField(@TypeOf(T.meta), field.name)) {
-            const field_meta = @field(T.meta, field.name);
-            if (@hasField(@TypeOf(field_meta), "short")) {
-                if (field_meta.short == short) {
-                    setValue(T, opts, field, has_meta, value) catch |e| return switch (e) {
-                        error.MissingValue => .missing_value,
-                        else => .invalid_value,
-                    };
-                    return .ok;
-                }
-            }
-        }
-    }
-    return .not_found;
-}
-
-fn setValue(
-    comptime T: type,
-    opts: *T,
-    comptime field: std.builtin.Type.StructField,
-    comptime has_meta: bool,
-    value: ?[]const u8,
-) ParseError!void {
-    const F = field.type;
-
-    // Bool fields are flags (no value needed)
-    if (F == bool) {
-        @field(opts, field.name) = true;
-        return;
-    }
-
-    // No value provided - check for flag_value in meta
-    if (value == null) {
-        if (has_meta and @hasField(@TypeOf(T.meta), field.name)) {
-            const field_meta = @field(T.meta, field.name);
-            if (@hasField(@TypeOf(field_meta), "flag_value")) {
-                @field(opts, field.name) = field_meta.flag_value;
-                return;
-            }
-        }
-        return ParseError.MissingValue;
-    }
-
-    // Check for custom parse function in meta
-    if (has_meta and @hasField(@TypeOf(T.meta), field.name)) {
-        const field_meta = @field(T.meta, field.name);
-        if (@hasField(@TypeOf(field_meta), "parse")) {
-            const result = field_meta.parse(value.?);
-            if (@typeInfo(@TypeOf(result)) == .error_union) {
-                @field(opts, field.name) = result catch return ParseError.InvalidValue;
-            } else if (@typeInfo(@TypeOf(result)) == .optional) {
-                @field(opts, field.name) = result orelse return ParseError.InvalidValue;
-            } else {
-                @field(opts, field.name) = result;
-            }
-            return;
-        }
-    }
-
-    // Repeatable options: append when the field is a list-like type.
-    if (listElemType(F)) |Elem| {
-        const parsed = try parseScalar(Elem, value.?);
-        var list_ptr = &@field(opts, field.name);
-        list_ptr.append(parsed) catch |e| {
-            const name = @errorName(e);
-            if (std.mem.eql(u8, name, "OutOfMemory")) return ParseError.OutOfMemory;
-            if (std.mem.eql(u8, name, "Overflow")) return ParseError.TooManyValues;
-            return ParseError.InvalidValue;
-        };
-        return;
-    }
-
-    @field(opts, field.name) = try parseScalar(F, value.?);
-}
-
-fn parseScalar(comptime T: type, value: []const u8) ParseError!T {
-    if (T == []const u8) return value;
-
-    switch (@typeInfo(T)) {
-        .optional => {
-            const Child = @typeInfo(T).optional.child;
-            const parsed = try parseScalar(Child, value);
-            return @as(T, parsed);
-        },
-        .int => return std.fmt.parseInt(T, value, 0) catch return ParseError.InvalidValue,
-        .@"enum" => return std.meta.stringToEnum(T, value) orelse return ParseError.InvalidValue,
-        else => return ParseError.InvalidValue,
-    }
-}
-
-/// Fixed-capacity list for repeatable options (no allocator required).
-///
-///   const Opts = struct {
-///       exclude: opt.Multi([]const u8, 32) = .{},
-///       pub const meta = .{ .exclude = .{ .short = 'x' } };
-///   };
-pub fn Multi(comptime Elem: type, comptime capacity: usize) type {
-    return struct {
-        const Self = @This();
-
-        buffer: [capacity]Elem = undefined,
-        len: usize = 0,
-
-        pub fn append(self: *Self, item: Elem) error{Overflow}!void {
-            if (self.len >= capacity) return error.Overflow;
-            self.buffer[self.len] = item;
-            self.len += 1;
-        }
-
-        pub fn slice(self: *Self) []Elem {
-            return self.buffer[0..self.len];
-        }
-
-        pub fn constSlice(self: *const Self) []const Elem {
-            return self.buffer[0..self.len];
-        }
-    };
-}
-
-fn listElemType(comptime ListT: type) ?type {
-    if (@typeInfo(ListT) != .@"struct") return null;
-
-    if (!@hasDecl(ListT, "append")) return null;
-    const append_info = @typeInfo(@TypeOf(ListT.append));
-    if (append_info != .@"fn") return null;
-    const params = append_info.@"fn".params;
-    if (params.len != 2) return null;
-
-    const fields = @typeInfo(ListT).@"struct".fields;
-    var elem: ?type = null;
-    inline for (fields) |field| {
-        if (std.mem.eql(u8, field.name, "items")) {
-            const info = @typeInfo(field.type);
-            if (info == .pointer and info.pointer.size == .slice) elem = info.pointer.child;
-        }
-        if (std.mem.eql(u8, field.name, "buffer")) {
-            const info = @typeInfo(field.type);
-            if (info == .array) elem = info.array.child;
-        }
-    }
-
-    const found = elem orelse return null;
-    const item_param = params[1].type orelse return null;
-    if (item_param != found) return null;
-
-    return found;
 }
 
 const spaces = "                        "; // 24 spaces
@@ -395,7 +101,7 @@ pub fn printUsage(comptime T: type, writer: anytype) void {
 fn typeName(comptime T: type) [:0]const u8 {
     if (T == []const u8) return "str";
     if (@typeInfo(T) == .optional) return typeName(@typeInfo(T).optional.child);
-    if (listElemType(T)) |Elem| return typeName(Elem);
+    if (options.listElemType(T)) |Elem| return typeName(Elem);
     if (@typeInfo(T) == .int) return @typeName(T);
     if (@typeInfo(T) == .@"enum") return "enum";
     return "?";
@@ -466,42 +172,6 @@ fn commandSpecOptions(comptime command_spec: anytype) type {
     return if (commandSpecIsBranch(command_spec)) command_spec.options else command_spec;
 }
 
-fn optionShort(comptime T: type, comptime field: std.builtin.Type.StructField) ?u8 {
-    if (!@hasDecl(T, "meta")) return null;
-    if (!@hasField(@TypeOf(T.meta), field.name)) return null;
-
-    const field_meta = @field(T.meta, field.name);
-    if (!@hasField(@TypeOf(field_meta), "short")) return null;
-    return field_meta.short;
-}
-
-fn validateOptionStruct(comptime T: type) void {
-    const info = @typeInfo(T);
-    if (info != .@"struct") @compileError("options must be a struct: " ++ @typeName(T));
-
-    const fields = info.@"struct".fields;
-
-    if (@hasDecl(T, "meta")) {
-        inline for (@typeInfo(@TypeOf(T.meta)).@"struct".fields) |meta_field| {
-            if (!@hasField(T, meta_field.name)) {
-                @compileError("meta entry has no matching option field: " ++ @typeName(T) ++ "." ++ meta_field.name);
-            }
-        }
-    }
-
-    inline for (fields, 0..) |left, left_idx| {
-        if (optionShort(T, left)) |left_short| {
-            inline for (fields[left_idx + 1 ..]) |right| {
-                if (optionShort(T, right)) |right_short| {
-                    if (left_short == right_short) {
-                        @compileError("duplicate short option in " ++ @typeName(T));
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn validateNoDuplicateOptionsBetween(comptime A: type, comptime B: type) void {
     const a_fields = @typeInfo(A).@"struct".fields;
     const b_fields = @typeInfo(B).@"struct".fields;
@@ -513,9 +183,9 @@ fn validateNoDuplicateOptionsBetween(comptime A: type, comptime B: type) void {
             }
         }
 
-        if (optionShort(A, a_field)) |a_short| {
+        if (options.optionShort(A, a_field)) |a_short| {
             inline for (b_fields) |b_field| {
-                if (optionShort(B, b_field)) |b_short| {
+                if (options.optionShort(B, b_field)) |b_short| {
                     if (a_short == b_short) {
                         @compileError("duplicate short option in visible command path between " ++ @typeName(A) ++ " and " ++ @typeName(B));
                     }
@@ -542,15 +212,15 @@ fn validateNoArityConflictBetween(comptime A: type, comptime B: type) void {
 
     inline for (a_fields) |a_field| {
         inline for (b_fields) |b_field| {
-            if (std.mem.eql(u8, a_field.name, b_field.name) and fieldArity(a_field) != fieldArity(b_field)) {
+            if (std.mem.eql(u8, a_field.name, b_field.name) and options.fieldArity(a_field) != options.fieldArity(b_field)) {
                 @compileError("option has conflicting arity in command tree: " ++ @typeName(A) ++ "." ++ a_field.name ++ " and " ++ @typeName(B) ++ "." ++ b_field.name);
             }
         }
 
-        if (optionShort(A, a_field)) |a_short| {
+        if (options.optionShort(A, a_field)) |a_short| {
             inline for (b_fields) |b_field| {
-                if (optionShort(B, b_field)) |b_short| {
-                    if (a_short == b_short and fieldArity(a_field) != fieldArity(b_field)) {
+                if (options.optionShort(B, b_field)) |b_short| {
+                    if (a_short == b_short and options.fieldArity(a_field) != options.fieldArity(b_field)) {
                         @compileError("short option has conflicting arity in command tree between " ++ @typeName(A) ++ " and " ++ @typeName(B));
                     }
                 }
@@ -613,7 +283,7 @@ fn validateCommandTree(comptime commands: anytype) void {
     inline for (@typeInfo(@TypeOf(commands)).@"struct".fields) |field| {
         const command_spec = @field(commands, field.name);
         const Opts = commandSpecOptions(command_spec);
-        validateOptionStruct(Opts);
+        options.validateOptionStruct(Opts);
         if (comptime commandSpecIsBranch(command_spec)) {
             validateCommandsAgainstScope(command_spec.commands, Opts);
             validateCommandTree(command_spec.commands);
@@ -622,7 +292,7 @@ fn validateCommandTree(comptime commands: anytype) void {
 }
 
 fn validateCommandParserSpec(comptime spec: anytype) void {
-    validateOptionStruct(spec.global);
+    options.validateOptionStruct(spec.global);
     validateCommandsAgainstScope(spec.commands, spec.global);
     validateCommandTree(spec.commands);
     validateCommandTreeArityConflicts(spec.commands);
@@ -635,10 +305,10 @@ fn longArityInCommandTree(comptime commands: anytype, name: []const u8) ?scanner
         const Opts = commandSpecOptions(command_spec);
         const opt_fields = @typeInfo(Opts).@"struct".fields;
         const has_meta = @hasDecl(Opts, "meta");
-        arity = combineArity(arity, longOptionArity(Opts, opt_fields, has_meta, name));
+        arity = options.combineArity(arity, options.longOptionArity(Opts, opt_fields, has_meta, name));
         if (arity == .value) return .value;
         if (comptime commandSpecIsBranch(command_spec)) {
-            arity = combineArity(arity, longArityInCommandTree(command_spec.commands, name));
+            arity = options.combineArity(arity, longArityInCommandTree(command_spec.commands, name));
             if (arity == .value) return .value;
         }
     }
@@ -652,10 +322,10 @@ fn shortArityInCommandTree(comptime commands: anytype, short: u8) ?scanner.Optio
         const Opts = commandSpecOptions(command_spec);
         const opt_fields = @typeInfo(Opts).@"struct".fields;
         const has_meta = @hasDecl(Opts, "meta");
-        arity = combineArity(arity, shortOptionArity(Opts, opt_fields, has_meta, short));
+        arity = options.combineArity(arity, options.shortOptionArity(Opts, opt_fields, has_meta, short));
         if (arity == .value) return .value;
         if (comptime commandSpecIsBranch(command_spec)) {
-            arity = combineArity(arity, shortArityInCommandTree(command_spec.commands, short));
+            arity = options.combineArity(arity, shortArityInCommandTree(command_spec.commands, short));
             if (arity == .value) return .value;
         }
     }
@@ -669,9 +339,9 @@ fn longArityInSelectedCommand(comptime commands: anytype, command: *const comman
             const Opts = commandSpecOptions(command_spec);
             const opt_fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            var arity = longOptionArity(Opts, opt_fields, has_meta, name);
+            var arity = options.longOptionArity(Opts, opt_fields, has_meta, name);
             if (comptime commandSpecIsBranch(command_spec)) {
-                arity = combineArity(arity, longArityInSelectedCommand(command_spec.commands, &payload.command, name));
+                arity = options.combineArity(arity, longArityInSelectedCommand(command_spec.commands, &payload.command, name));
             }
             return arity;
         },
@@ -685,9 +355,9 @@ fn shortArityInSelectedCommand(comptime commands: anytype, command: *const comma
             const Opts = commandSpecOptions(command_spec);
             const opt_fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            var arity = shortOptionArity(Opts, opt_fields, has_meta, short);
+            var arity = options.shortOptionArity(Opts, opt_fields, has_meta, short);
             if (comptime commandSpecIsBranch(command_spec)) {
-                arity = combineArity(arity, shortArityInSelectedCommand(command_spec.commands, &payload.command, short));
+                arity = options.combineArity(arity, shortArityInSelectedCommand(command_spec.commands, &payload.command, short));
             }
             return arity;
         },
@@ -702,15 +372,15 @@ fn CommandDiscoveryResolver(comptime G: type, comptime Scope: type, comptime com
         const scope_has_meta = if (Scope != void) @hasDecl(Scope, "meta") else false;
 
         pub fn longArity(_: @This(), name: []const u8) ?scanner.OptionArity {
-            return combineArity(
-                combineArity(longOptionArity(G, g_fields, g_has_meta, name), if (Scope != void) longOptionArity(Scope, scope_fields, scope_has_meta, name) else null),
+            return options.combineArity(
+                options.combineArity(options.longOptionArity(G, g_fields, g_has_meta, name), if (Scope != void) options.longOptionArity(Scope, scope_fields, scope_has_meta, name) else null),
                 longArityInCommandTree(commands, name),
             );
         }
 
         pub fn shortArity(_: @This(), short: u8) ?scanner.OptionArity {
-            return combineArity(
-                combineArity(shortOptionArity(G, g_fields, g_has_meta, short), if (Scope != void) shortOptionArity(Scope, scope_fields, scope_has_meta, short) else null),
+            return options.combineArity(
+                options.combineArity(options.shortOptionArity(G, g_fields, g_has_meta, short), if (Scope != void) options.shortOptionArity(Scope, scope_fields, scope_has_meta, short) else null),
                 shortArityInCommandTree(commands, short),
             );
         }
@@ -725,11 +395,11 @@ fn SelectedCommandResolver(comptime G: type, comptime commands: anytype) type {
         const g_has_meta = @hasDecl(G, "meta");
 
         pub fn longArity(self: @This(), name: []const u8) ?scanner.OptionArity {
-            return combineArity(longOptionArity(G, g_fields, g_has_meta, name), longArityInSelectedCommand(commands, self.command, name));
+            return options.combineArity(options.longOptionArity(G, g_fields, g_has_meta, name), longArityInSelectedCommand(commands, self.command, name));
         }
 
         pub fn shortArity(self: @This(), short: u8) ?scanner.OptionArity {
-            return combineArity(shortOptionArity(G, g_fields, g_has_meta, short), shortArityInSelectedCommand(commands, self.command, short));
+            return options.combineArity(options.shortOptionArity(G, g_fields, g_has_meta, short), shortArityInSelectedCommand(commands, self.command, short));
         }
     };
 }
@@ -754,7 +424,7 @@ fn setLongInSelectedCommand(
     name: []const u8,
     is_negated: bool,
     value: ?[]const u8,
-) FieldResult {
+) options.FieldResult {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
@@ -762,9 +432,9 @@ fn setLongInSelectedCommand(
             const fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
             const result = if (is_negated)
-                setFieldNegated(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name)
+                options.setFieldNegated(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name)
             else
-                setField(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name, value);
+                options.setField(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, name, value);
             switch (result) {
                 .ok, .missing_value, .invalid_value => return result,
                 .not_found => {},
@@ -782,14 +452,14 @@ fn setShortInSelectedCommand(
     command: *commandUnion(commands),
     short: u8,
     value: ?[]const u8,
-) FieldResult {
+) options.FieldResult {
     switch (command.*) {
         inline else => |*payload, tag| {
             const command_spec = @field(commands, @tagName(tag));
             const Opts = commandSpecOptions(command_spec);
             const fields = @typeInfo(Opts).@"struct".fields;
             const has_meta = @hasDecl(Opts, "meta");
-            const result = setFieldByShort(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, short, value);
+            const result = options.setFieldByShort(Opts, fields, has_meta, if (comptime commandSpecIsBranch(command_spec)) &payload.options else payload, short, value);
             switch (result) {
                 .ok, .missing_value, .invalid_value => return result,
                 .not_found => {},
@@ -808,15 +478,15 @@ fn discoverCommand(
     comptime commands: anytype,
     args: []const []const u8,
     start_index: usize,
-) ParseError!commandFound(commands) {
+) errors.ParseError!commandFound(commands) {
     const command_fields = @typeInfo(@TypeOf(commands)).@"struct".fields;
 
     var arg_scanner = scanner.ArgScanner.init(args, start_index);
     const resolver = CommandDiscoveryResolver(G, Scope, commands){};
     while (arg_scanner.next(resolver)) |token| {
         switch (token) {
-            .help => return ParseError.Help,
-            .end_options => return ParseError.MissingCommand,
+            .help => return errors.ParseError.Help,
+            .end_options => return errors.ParseError.MissingCommand,
             .option => {},
             .positional => |pos| {
                 inline for (command_fields) |field| {
@@ -844,12 +514,12 @@ fn discoverCommand(
                         }
                     }
                 }
-                return ParseError.UnknownCommand;
+                return errors.ParseError.UnknownCommand;
             },
         }
     }
 
-    return ParseError.MissingCommand;
+    return errors.ParseError.MissingCommand;
 }
 
 fn parseSelectedCommand(
@@ -860,7 +530,7 @@ fn parseSelectedCommand(
     root_command_index: usize,
     args: []const []const u8,
     positionals_buf: [][]const u8,
-) ParseError![]const []const u8 {
+) errors.ParseError![]const []const u8 {
     const g_fields = @typeInfo(G).@"struct".fields;
     const g_has_meta = @hasDecl(G, "meta");
 
@@ -869,7 +539,7 @@ fn parseSelectedCommand(
     const resolver = SelectedCommandResolver(G, commands){ .command = command };
     while (arg_scanner.next(resolver)) |token| {
         switch (token) {
-            .help => return ParseError.Help,
+            .help => return errors.ParseError.Help,
             .end_options => {},
             .positional => |pos| {
                 if (selectedCommandIndex(commands, command, root_command_index, pos.index)) continue;
@@ -878,15 +548,15 @@ fn parseSelectedCommand(
             .option => |opt| {
                 const g_result = switch (opt.key) {
                     .long => |name| if (opt.negated)
-                        setFieldNegated(G, g_fields, g_has_meta, global, name)
+                        options.setFieldNegated(G, g_fields, g_has_meta, global, name)
                     else
-                        setField(G, g_fields, g_has_meta, global, name, opt.value),
-                    .short => |short| setFieldByShort(G, g_fields, g_has_meta, global, short, opt.value),
+                        options.setField(G, g_fields, g_has_meta, global, name, opt.value),
+                    .short => |short| options.setFieldByShort(G, g_fields, g_has_meta, global, short, opt.value),
                 };
                 switch (g_result) {
                     .ok => continue,
-                    .missing_value => return ParseError.MissingValue,
-                    .invalid_value => return ParseError.InvalidValue,
+                    .missing_value => return errors.ParseError.MissingValue,
+                    .invalid_value => return errors.ParseError.InvalidValue,
                     .not_found => {},
                 }
 
@@ -896,9 +566,9 @@ fn parseSelectedCommand(
                 };
                 switch (c_result) {
                     .ok => {},
-                    .missing_value => return ParseError.MissingValue,
-                    .invalid_value => return ParseError.InvalidValue,
-                    .not_found => return ParseError.UnknownOption,
+                    .missing_value => return errors.ParseError.MissingValue,
+                    .invalid_value => return errors.ParseError.InvalidValue,
+                    .not_found => return errors.ParseError.UnknownOption,
                 }
             },
         }
@@ -926,7 +596,7 @@ pub fn CommandParser(comptime spec: anytype) type {
             positionals: []const []const u8,
         };
 
-        pub fn parse(args: []const []const u8, positionals_buf: [][]const u8) ParseError!Result {
+        pub fn parse(args: []const []const u8, positionals_buf: [][]const u8) errors.ParseError!Result {
             var global = Global{};
             var found = try discoverCommand(Global, void, spec.commands, args, 0);
             const positionals = try parseSelectedCommand(Global, spec.commands, &global, &found.command, found.command_index, args, positionals_buf);
@@ -1022,7 +692,7 @@ fn printFields(comptime T: type, writer: anytype) void {
 
 // ============ Tests ============
 
-fn parseNoPositionals(comptime T: type, opts: *T, args: []const []const u8) ParseError!void {
+fn parseNoPositionals(comptime T: type, opts: *T, args: []const []const u8) errors.ParseError!void {
     var positionals: [0][]const u8 = .{};
     _ = try parse(T, opts, args, &positionals);
 }
@@ -1095,7 +765,7 @@ test "positionals use caller-owned storage" {
 
     var too_small_opts = Opts{};
     var too_small: [1][]const u8 = undefined;
-    try std.testing.expectError(ParseError.TooManyPositionals, parse(Opts, &too_small_opts, &.{ "one", "two" }, &too_small));
+    try std.testing.expectError(errors.ParseError.TooManyPositionals, parse(Opts, &too_small_opts, &.{ "one", "two" }, &too_small));
 }
 
 test "help flag returns error" {
@@ -1105,7 +775,7 @@ test "help flag returns error" {
 
     var opts = Opts{};
     const result = parseNoPositionals(Opts, &opts, &.{"--help"});
-    try std.testing.expectError(ParseError.Help, result);
+    try std.testing.expectError(errors.ParseError.Help, result);
 }
 
 test "printUsage output" {
@@ -1206,8 +876,8 @@ test "CommandParser finds command after valued global option" {
     try std.testing.expectEqualStrings("--force", stopped.positionals[0]);
     try std.testing.expectEqualStrings("pos", stopped.positionals[1]);
 
-    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "--", "restart" }, &positionals));
-    try std.testing.expectError(ParseError.Help, Cli.parse(&.{"--help"}, &positionals));
+    try std.testing.expectError(errors.ParseError.MissingCommand, Cli.parse(&.{ "--", "restart" }, &positionals));
+    try std.testing.expectError(errors.ParseError.Help, Cli.parse(&.{"--help"}, &positionals));
 }
 
 test "CommandParser supports nested command groups" {
@@ -1258,7 +928,7 @@ test "CommandParser supports nested command groups" {
     try std.testing.expectEqual(@as(usize, 1), parsed.positionals.len);
     try std.testing.expectEqualStrings("pos1", parsed.positionals[0]);
 
-    try std.testing.expectError(ParseError.MissingCommand, Cli.parse(&.{ "service", "--", "restart" }, &positionals));
+    try std.testing.expectError(errors.ParseError.MissingCommand, Cli.parse(&.{ "service", "--", "restart" }, &positionals));
 }
 
 test "repeatable option appends" {
@@ -1478,7 +1148,7 @@ test "flag_value followed by other flags" {
     {
         var opts = Opts{};
         const result = parseNoPositionals(Opts, &opts, &.{"--level"});
-        try std.testing.expectError(ParseError.MissingValue, result);
+        try std.testing.expectError(errors.ParseError.MissingValue, result);
     }
 }
 
@@ -1516,7 +1186,7 @@ test "custom parse function" {
     {
         var opts = Opts{};
         const result = parseNoPositionals(Opts, &opts, &.{ "--chmod", "899" });
-        try std.testing.expectError(ParseError.InvalidValue, result);
+        try std.testing.expectError(errors.ParseError.InvalidValue, result);
     }
 }
 
@@ -1548,7 +1218,7 @@ test "custom parse function returning error union" {
     {
         var opts = Opts{};
         const result = parseNoPositionals(Opts, &opts, &.{ "--port", "80" });
-        try std.testing.expectError(ParseError.InvalidValue, result);
+        try std.testing.expectError(errors.ParseError.InvalidValue, result);
     }
 }
 
